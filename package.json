@@ -1,0 +1,19 @@
+{
+  "name": "collar-gps-server",
+  "version": "3.0.0",
+  "description": "CollarGPS Server v3 — Node.js + PostgreSQL para Render.com",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "pg": "^8.11.5"
+  }
+}
