@@ -54,11 +54,26 @@ async function initDB() {
     );
 
     CREATE TABLE IF NOT EXISTS geovallas (
-      id       SERIAL PRIMARY KEY,
-      nombre   TEXT NOT NULL DEFAULT 'valla principal',
-      poligono JSONB NOT NULL,
-      activa   BOOLEAN DEFAULT true,
-      created  TIMESTAMPTZ DEFAULT NOW()
+      id            SERIAL PRIMARY KEY,
+      nombre        TEXT    NOT NULL DEFAULT 'potrero principal',
+      tipo          TEXT    NOT NULL DEFAULT 'permanente',
+      poligono      JSONB   NOT NULL,
+      activa        BOOLEAN DEFAULT true,
+      warn_dist_m   REAL    DEFAULT 12,
+      color         TEXT    DEFAULT '#1D9E75',
+      collares      JSONB   DEFAULT '[]',
+      expira_en     TIMESTAMPTZ,
+      creada_por    TEXT    DEFAULT 'app',
+      created       TIMESTAMPTZ DEFAULT NOW(),
+      updated       TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS historial_cercas (
+      id         SERIAL PRIMARY KEY,
+      valla_id   INT REFERENCES geovallas(id) ON DELETE CASCADE,
+      accion     TEXT NOT NULL,
+      detalle    JSONB,
+      ts         TIMESTAMPTZ DEFAULT NOW()
     );
 
     CREATE TABLE IF NOT EXISTS alertas (
@@ -151,13 +166,33 @@ app.post('/gps', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────
-//  GET /geovallas  — el gateway descarga la geovalla activa
+//  GET /geovallas
+//  Sin params       → todas activas (gateway)
+//  ?device=collar_01 → solo las que aplican a ese collar
+//  ?todas=true       → incluye inactivas (dashboard)
 // ─────────────────────────────────────────────────────────────
 app.get('/geovallas', async (req, res) => {
+  const { device, todas } = req.query;
   try {
-    const { rows } = await pool.query(
-      'SELECT * FROM geovallas WHERE activa = true ORDER BY id DESC LIMIT 1'
-    );
+    // Expirar cercas temporales vencidas automáticamente
+    await pool.query(`
+      UPDATE geovallas SET activa = false
+      WHERE tipo = 'temporal' AND expira_en IS NOT NULL
+        AND expira_en < NOW() AND activa = true
+    `);
+
+    let query = 'SELECT * FROM geovallas';
+    const params = [];
+    if (todas !== 'true') {
+      query += ' WHERE activa = true';
+    }
+    if (device) {
+      const cond = toda !== 'true' ? ' AND' : ' WHERE';
+      query += `${cond} (collares = '[]'::jsonb OR collares @> $1::jsonb)`;
+      params.push(JSON.stringify([device]));
+    }
+    query += ' ORDER BY tipo DESC, id DESC';
+    const { rows } = await pool.query(query, params);
     res.json(rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -165,28 +200,119 @@ app.get('/geovallas', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────
-//  POST /geovallas  — el dashboard crea o actualiza la geovalla
-//  Body: { nombre, poligono: [{lat, lng}, ...] }
+//  POST /geovallas
+//  { nombre, tipo, poligono, warn_dist_m, color,
+//    collares, horas, expira_en }
+//  tipo: "permanente" | "temporal" | "exclusion"
 // ─────────────────────────────────────────────────────────────
 app.post('/geovallas', async (req, res) => {
-  const { nombre = 'valla principal', poligono } = req.body;
+  const {
+    nombre      = 'potrero',
+    tipo        = 'permanente',
+    poligono,
+    warn_dist_m = 12,
+    color       = '#1D9E75',
+    collares    = [],
+    horas,
+    expira_en
+  } = req.body;
 
-  if (!poligono || !Array.isArray(poligono) || poligono.length < 3) {
-    return res.status(400).json({ error: 'poligono debe tener al menos 3 puntos' });
+  if (!poligono || !Array.isArray(poligono) || poligono.length < 3)
+    return res.status(400).json({ error: 'poligono necesita al menos 3 puntos' });
+  if (!['permanente','temporal','exclusion'].includes(tipo))
+    return res.status(400).json({ error: 'tipo invalido' });
+
+  let expiraCalc = null;
+  if (tipo === 'temporal') {
+    if (horas)      expiraCalc = new Date(Date.now() + horas * 3600000).toISOString();
+    else if (expira_en) expiraCalc = new Date(expira_en).toISOString();
+    else return res.status(400).json({ error: 'cercas temporales requieren horas o expira_en' });
   }
 
   try {
-    // Desactivar vallas anteriores
-    await pool.query('UPDATE geovallas SET activa = false');
-    // Insertar la nueva
-    const { rows } = await pool.query(
-      'INSERT INTO geovallas (nombre, poligono, activa) VALUES ($1,$2,true) RETURNING *',
-      [nombre, JSON.stringify(poligono)]
+    const { rows } = await pool.query(`
+      INSERT INTO geovallas
+        (nombre,tipo,poligono,activa,warn_dist_m,color,collares,expira_en,creada_por)
+      VALUES ($1,$2,$3,true,$4,$5,$6,$7,$8,'app') RETURNING *
+    `, [nombre, tipo, JSON.stringify(poligono),
+        warn_dist_m, color, JSON.stringify(collares), expiraCalc]);
+
+    await pool.query(
+      'INSERT INTO historial_cercas (valla_id,accion,detalle) VALUES ($1,$2,$3)',
+      [rows[0].id, 'creada', JSON.stringify({tipo, horas, expiraCalc})]
     );
+    console.log(`🗺️  Cerca "${nombre}" [${tipo}] — expira: ${expiraCalc||'nunca'}`);
     res.json({ ok: true, valla: rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// ─────────────────────────────────────────────────────────────
+//  PATCH /geovallas/:id — mover polígono, extender tiempo, etc.
+// ─────────────────────────────────────────────────────────────
+app.patch('/geovallas/:id', async (req, res) => {
+  const id = parseInt(req.params.id);
+  const { nombre, poligono, activa, warn_dist_m, color,
+          collares, horas_extra, expira_en } = req.body;
+  try {
+    const { rows: cur } = await pool.query('SELECT * FROM geovallas WHERE id=$1',[id]);
+    if (!cur.length) return res.status(404).json({ error: 'cerca no encontrada' });
+    const v = cur[0];
+
+    let nuevaExp = v.expira_en;
+    if (horas_extra && v.tipo === 'temporal') {
+      const base = v.expira_en ? new Date(v.expira_en) : new Date();
+      nuevaExp = new Date(base.getTime() + horas_extra * 3600000).toISOString();
+    } else if (expira_en) {
+      nuevaExp = new Date(expira_en).toISOString();
+    }
+
+    const { rows } = await pool.query(`
+      UPDATE geovallas SET
+        nombre=$1, poligono=COALESCE($2,poligono), activa=COALESCE($3,activa),
+        warn_dist_m=COALESCE($4,warn_dist_m), color=COALESCE($5,color),
+        collares=COALESCE($6,collares), expira_en=$7, updated=NOW()
+      WHERE id=$8 RETURNING *
+    `, [nombre||v.nombre,
+        poligono?JSON.stringify(poligono):null,
+        activa!==undefined?activa:null,
+        warn_dist_m||null, color||null,
+        collares?JSON.stringify(collares):null,
+        nuevaExp, id]);
+
+    await pool.query(
+      'INSERT INTO historial_cercas (valla_id,accion,detalle) VALUES ($1,$2,$3)',
+      [id,'modificada',JSON.stringify(req.body)]
+    );
+    res.json({ ok: true, valla: rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ─────────────────────────────────────────────────────────────
+//  DELETE /geovallas/:id — desactivar (no borra el registro)
+// ─────────────────────────────────────────────────────────────
+app.delete('/geovallas/:id', async (req, res) => {
+  try {
+    await pool.query('UPDATE geovallas SET activa=false,updated=NOW() WHERE id=$1',[req.params.id]);
+    await pool.query('INSERT INTO historial_cercas (valla_id,accion) VALUES ($1,$2)',[req.params.id,'desactivada']);
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ─────────────────────────────────────────────────────────────
+//  GET /geovallas/historial?valla_id=1
+// ─────────────────────────────────────────────────────────────
+app.get('/geovallas/historial', async (req, res) => {
+  const { valla_id } = req.query;
+  try {
+    const { rows } = await pool.query(`
+      SELECT h.*,g.nombre FROM historial_cercas h
+      JOIN geovallas g ON h.valla_id=g.id
+      ${valla_id?'WHERE h.valla_id=$1':''} ORDER BY h.ts DESC LIMIT 50
+    `, valla_id?[valla_id]:[]);
+    res.json(rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ─────────────────────────────────────────────────────────────
