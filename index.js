@@ -251,7 +251,7 @@ app.post('/geovallas', async (req, res) => {
     const { rows } = await pool.query(`
       INSERT INTO geovallas
         (nombre,tipo,poligono,activa,warn_dist_m,color,collares,expira_en,creada_por)
-      VALUES ($1,$2,$3,true,$4,$5,$6,$7,$8,'app') RETURNING *
+      VALUES ($1,$2,$3,true,$4,$5,$6,$7,'app') RETURNING *
     `, [nombre, tipo, JSON.stringify(poligono),
         warn_dist_m, color, JSON.stringify(collares), expiraCalc]);
 
