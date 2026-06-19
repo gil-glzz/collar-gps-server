@@ -18,9 +18,13 @@ require('dotenv').config();
 const express = require('express');
 const { Pool }  = require('pg');
 const cors      = require('cors');
+const crypto    = require('crypto');   // nativo de Node, para hash de contraseñas
 
 const app  = express();
 const port = process.env.PORT || 3000;
+
+// Contraseña de admin (para crear cuentas). Cámbiala con una variable de entorno.
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'lindero-admin-2026';
 
 app.use(cors());
 app.use(express.json());
@@ -32,6 +36,58 @@ const pool = new Pool({
     ? { rejectUnauthorized: false }
     : false
 });
+
+// ─────────────────────────────────────────────────────────────
+//  AUTENTICACIÓN — hash de contraseñas y tokens de sesión
+// ─────────────────────────────────────────────────────────────
+// Hash de contraseña con scrypt (incluido en Node, seguro).
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.scryptSync(password, salt, 64).toString('hex');
+  return salt + ':' + hash;
+}
+function verifyPassword(password, stored) {
+  const [salt, hash] = stored.split(':');
+  const test = crypto.scryptSync(password, salt, 64).toString('hex');
+  return crypto.timingSafeEqual(Buffer.from(hash), Buffer.from(test));
+}
+// Token de sesión simple: id de usuario + firma. No expira (piloto).
+function crearToken(userId) {
+  const payload = userId + '.' + Date.now();
+  const firma = crypto.createHmac('sha256', ADMIN_PASSWORD).update(payload).digest('hex');
+  return Buffer.from(payload + '.' + firma).toString('base64');
+}
+function verificarToken(token) {
+  try {
+    const decoded = Buffer.from(token, 'base64').toString();
+    const [userId, ts, firma] = decoded.split('.');
+    const payload = userId + '.' + ts;
+    const esperada = crypto.createHmac('sha256', ADMIN_PASSWORD).update(payload).digest('hex');
+    if (firma === esperada) return userId;
+  } catch(e) {}
+  return null;
+}
+// Middleware: extrae el usuario del header Authorization
+function requireAuth(req, res, next) {
+  const auth = req.headers.authorization || '';
+  const token = auth.replace('Bearer ', '');
+  const userId = verificarToken(token);
+  if (!userId) return res.status(401).json({ error: 'no autorizado' });
+  req.userId = userId;
+  next();
+}
+// Middleware: verifica la contraseña de admin (header x-admin-password)
+function requireAdmin(req, res, next) {
+  if (req.headers['x-admin-password'] !== ADMIN_PASSWORD) {
+    return res.status(403).json({ error: 'admin requerido' });
+  }
+  next();
+}
+// Obtener el correo (dueño) a partir del id de usuario del token
+async function correoDeUsuario(userId) {
+  const { rows } = await pool.query('SELECT correo FROM usuarios WHERE id=$1', [userId]);
+  return rows.length ? rows[0].correo : null;
+}
 
 // ── Inicializar tablas al arrancar ───────────────────────────
 async function initDB() {
@@ -95,6 +151,42 @@ async function initDB() {
       updated   TIMESTAMPTZ DEFAULT NOW()
     );
 
+    CREATE TABLE IF NOT EXISTS lotes (
+      id      BIGINT PRIMARY KEY,
+      nombre  TEXT NOT NULL,
+      color   TEXT DEFAULT '#4ade80',
+      dueno   TEXT DEFAULT 'default',
+      updated TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS animales (
+      id      BIGINT PRIMARY KEY,
+      nombre  TEXT NOT NULL,
+      collar  TEXT,
+      arete   TEXT,
+      peso    INT DEFAULT 0,
+      edad    INT DEFAULT 0,
+      raza    TEXT,
+      sexo    TEXT,
+      lote    BIGINT,
+      notas   TEXT,
+      dueno   TEXT DEFAULT 'default',
+      updated TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS usuarios (
+      id       SERIAL PRIMARY KEY,
+      correo   TEXT NOT NULL UNIQUE,
+      password TEXT NOT NULL,
+      rancho   TEXT NOT NULL,
+      creado   TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS collar_dueno (
+      device TEXT PRIMARY KEY,
+      dueno  TEXT NOT NULL
+    );
+
     CREATE INDEX IF NOT EXISTS idx_pos_device ON posiciones(device);
     CREATE INDEX IF NOT EXISTS idx_pos_ts     ON posiciones(ts DESC);
     CREATE INDEX IF NOT EXISTS idx_alertas_ts ON alertas(ts DESC);
@@ -110,7 +202,8 @@ async function initDB() {
     `ALTER TABLE geovallas ADD COLUMN IF NOT EXISTS collares JSONB DEFAULT '[]'`,
     `ALTER TABLE geovallas ADD COLUMN IF NOT EXISTS expira_en TIMESTAMPTZ`,
     `ALTER TABLE geovallas ADD COLUMN IF NOT EXISTS creada_por TEXT DEFAULT 'app'`,
-    `ALTER TABLE geovallas ADD COLUMN IF NOT EXISTS updated TIMESTAMPTZ DEFAULT NOW()`
+    `ALTER TABLE geovallas ADD COLUMN IF NOT EXISTS updated TIMESTAMPTZ DEFAULT NOW()`,
+    `ALTER TABLE geovallas ADD COLUMN IF NOT EXISTS dueno TEXT DEFAULT 'default'`
   ];
   for (const m of migraciones) {
     try { await pool.query(m); }
@@ -191,6 +284,9 @@ app.post('/gps', async (req, res) => {
 // ─────────────────────────────────────────────────────────────
 app.get('/geovallas', async (req, res) => {
   const { device, todas } = req.query;
+  // Si el dashboard manda token, filtrar por su dueño
+  const auth = req.headers.authorization || '';
+  const userId = verificarToken(auth.replace('Bearer ', ''));
   try {
     // Expirar cercas temporales vencidas automáticamente
     await pool.query(`
@@ -201,6 +297,17 @@ app.get('/geovallas', async (req, res) => {
 
     let query = 'SELECT * FROM geovallas';
     const params = [];
+
+    if (userId) {
+      // Dashboard autenticado: solo las cercas de su rancho
+      const dueno = await correoDeUsuario(userId);
+      params.push(dueno);
+      query += ' WHERE dueno = $1';
+      if (!todas) query += ' AND activa = true';
+      query += ' ORDER BY id DESC';
+      const { rows } = await pool.query(query, params);
+      return res.json(rows);
+    }
     if (todas !== 'true') {
       query += ' WHERE activa = true';
     }
@@ -248,18 +355,23 @@ app.post('/geovallas', async (req, res) => {
   }
 
   try {
+    // El dueño viene del token del dashboard
+    const auth = req.headers.authorization || '';
+    const userId = verificarToken(auth.replace('Bearer ', ''));
+    const dueno = userId ? await correoDeUsuario(userId) : 'default';
+
     const { rows } = await pool.query(`
       INSERT INTO geovallas
-        (nombre,tipo,poligono,activa,warn_dist_m,color,collares,expira_en,creada_por)
-      VALUES ($1,$2,$3,true,$4,$5,$6,$7,'app') RETURNING *
+        (nombre,tipo,poligono,activa,warn_dist_m,color,collares,expira_en,creada_por,dueno)
+      VALUES ($1,$2,$3,true,$4,$5,$6,$7,'app',$8) RETURNING *
     `, [nombre, tipo, JSON.stringify(poligono),
-        warn_dist_m, color, JSON.stringify(collares), expiraCalc]);
+        warn_dist_m, color, JSON.stringify(collares), expiraCalc, dueno]);
 
     await pool.query(
       'INSERT INTO historial_cercas (valla_id,accion,detalle) VALUES ($1,$2,$3)',
       [rows[0].id, 'creada', JSON.stringify({tipo, horas, expiraCalc})]
     );
-    console.log(`🗺️  Cerca "${nombre}" [${tipo}] — expira: ${expiraCalc||'nunca'}`);
+    console.log(`🗺️  Cerca "${nombre}" [${tipo}] dueño:${dueno}`);
     res.json({ ok: true, valla: rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -485,19 +597,162 @@ app.get('/actividad', async (req, res) => {
 // ─────────────────────────────────────────────────────────────
 //  GET /collares  — lista todos los devices con su última pos.
 // ─────────────────────────────────────────────────────────────
-app.get('/collares', async (req, res) => {
+app.get('/collares', requireAuth, async (req, res) => {
   try {
+    const dueno = await correoDeUsuario(req.userId);
     const { rows } = await pool.query(`
-      SELECT DISTINCT ON (device)
-        device, lat, lng, estado, movimiento,
-        aceleracion, shock_pwr, sats, rssi, dist_borde, ts
-      FROM posiciones
-      ORDER BY device, ts DESC
-    `);
+      SELECT DISTINCT ON (p.device)
+        p.device, p.lat, p.lng, p.estado, p.movimiento,
+        p.aceleracion, p.shock_pwr, p.sats, p.rssi, p.dist_borde, p.ts
+      FROM posiciones p
+      JOIN collar_dueno cd ON cd.device = p.device
+      WHERE cd.dueno = $1
+      ORDER BY p.device, p.ts DESC
+    `, [dueno]);
     res.json(rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// ─────────────────────────────────────────────────────────────
+//  ANIMALES — guardar y leer perfiles (permanente)
+// ─────────────────────────────────────────────────────────────
+app.get('/animales', requireAuth, async (req, res) => {
+  try {
+    const dueno = await correoDeUsuario(req.userId);
+    const { rows } = await pool.query('SELECT * FROM animales WHERE dueno=$1 ORDER BY id', [dueno]);
+    res.json(rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Crear o actualizar un animal (upsert por id)
+app.post('/animales', requireAuth, async (req, res) => {
+  const a = req.body;
+  if (!a || !a.id) return res.status(400).json({ error: 'falta id' });
+  try {
+    const dueno = await correoDeUsuario(req.userId);
+    const { rows } = await pool.query(`
+      INSERT INTO animales (id,nombre,collar,arete,peso,edad,raza,sexo,lote,notas,dueno,updated)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
+      ON CONFLICT (id) DO UPDATE SET
+        nombre=$2, collar=$3, arete=$4, peso=$5, edad=$6,
+        raza=$7, sexo=$8, lote=$9, notas=$10, updated=NOW()
+      WHERE animales.dueno=$11
+      RETURNING *
+    `, [a.id, a.nombre||'Sin nombre', a.collar||'', a.arete||'',
+        a.peso||0, a.edad||0, a.raza||'', a.sexo||'', a.lote||null, a.notas||'', dueno]);
+    res.json({ ok: true, animal: rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/animales/:id', requireAuth, async (req, res) => {
+  try {
+    const dueno = await correoDeUsuario(req.userId);
+    await pool.query('DELETE FROM animales WHERE id=$1 AND dueno=$2', [req.params.id, dueno]);
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ─────────────────────────────────────────────────────────────
+//  LOTES — guardar y leer (permanente, por dueño)
+// ─────────────────────────────────────────────────────────────
+app.get('/lotes', requireAuth, async (req, res) => {
+  try {
+    const dueno = await correoDeUsuario(req.userId);
+    const { rows } = await pool.query('SELECT * FROM lotes WHERE dueno=$1 ORDER BY id', [dueno]);
+    res.json(rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/lotes', requireAuth, async (req, res) => {
+  const l = req.body;
+  if (!l || !l.id) return res.status(400).json({ error: 'falta id' });
+  try {
+    const dueno = await correoDeUsuario(req.userId);
+    const { rows } = await pool.query(`
+      INSERT INTO lotes (id,nombre,color,dueno,updated)
+      VALUES ($1,$2,$3,$4,NOW())
+      ON CONFLICT (id) DO UPDATE SET nombre=$2, color=$3, updated=NOW()
+      WHERE lotes.dueno=$4
+      RETURNING *
+    `, [l.id, l.nombre||'Lote', l.color||'#4ade80', dueno]);
+    res.json({ ok: true, lote: rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/lotes/:id', requireAuth, async (req, res) => {
+  try {
+    const dueno = await correoDeUsuario(req.userId);
+    await pool.query('DELETE FROM lotes WHERE id=$1 AND dueno=$2', [req.params.id, dueno]);
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ─────────────────────────────────────────────────────────────
+//  AUTENTICACIÓN — login y administración de cuentas
+// ─────────────────────────────────────────────────────────────
+
+// Login: correo + password → devuelve token y datos del rancho
+app.post('/login', async (req, res) => {
+  const { correo, password } = req.body;
+  if (!correo || !password) return res.status(400).json({ error: 'faltan datos' });
+  try {
+    const { rows } = await pool.query('SELECT * FROM usuarios WHERE correo=$1', [correo.toLowerCase().trim()]);
+    if (!rows.length) return res.status(401).json({ error: 'correo o contraseña incorrectos' });
+    const u = rows[0];
+    if (!verifyPassword(password, u.password)) {
+      return res.status(401).json({ error: 'correo o contraseña incorrectos' });
+    }
+    const token = crearToken(u.id);
+    res.json({ ok: true, token, rancho: u.rancho, correo: u.correo });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ADMIN: crear una cuenta de rancho (requiere contraseña de admin)
+app.post('/admin/usuarios', requireAdmin, async (req, res) => {
+  const { correo, password, rancho } = req.body;
+  if (!correo || !password || !rancho) return res.status(400).json({ error: 'faltan datos' });
+  try {
+    const hash = hashPassword(password);
+    const { rows } = await pool.query(
+      'INSERT INTO usuarios (correo,password,rancho) VALUES ($1,$2,$3) RETURNING id,correo,rancho',
+      [correo.toLowerCase().trim(), hash, rancho]
+    );
+    res.json({ ok: true, usuario: rows[0] });
+  } catch (err) {
+    if (err.code === '23505') return res.status(400).json({ error: 'ese correo ya existe' });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ADMIN: listar cuentas
+app.get('/admin/usuarios', requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT id,correo,rancho,creado FROM usuarios ORDER BY id');
+    res.json(rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ADMIN: borrar una cuenta
+app.delete('/admin/usuarios/:id', requireAdmin, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM usuarios WHERE id=$1', [req.params.id]);
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ADMIN: asignar un collar (device) a un rancho (correo del dueño)
+app.post('/admin/asignar-collar', requireAdmin, async (req, res) => {
+  const { device, dueno } = req.body;
+  if (!device || !dueno) return res.status(400).json({ error: 'faltan datos' });
+  try {
+    await pool.query(
+      'INSERT INTO collar_dueno (device,dueno) VALUES ($1,$2) ON CONFLICT (device) DO UPDATE SET dueno=$2',
+      [device, dueno.toLowerCase().trim()]
+    );
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ─────────────────────────────────────────────────────────────
