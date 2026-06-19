@@ -490,7 +490,7 @@ app.get('/collares', async (req, res) => {
     const { rows } = await pool.query(`
       SELECT DISTINCT ON (device)
         device, lat, lng, estado, movimiento,
-        aceleracion, shock_pwr, sats, ts
+        aceleracion, shock_pwr, sats, rssi, dist_borde, ts
       FROM posiciones
       ORDER BY device, ts DESC
     `);
