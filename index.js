@@ -928,9 +928,16 @@ app.get('/admin/usuarios', requireAdmin, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ADMIN: borrar una cuenta
+// ADMIN: borrar una cuenta (y liberar sus collares para reasignarlos)
 app.delete('/admin/usuarios/:id', requireAdmin, async (req, res) => {
   try {
+    // Buscar el correo del usuario para liberar sus collares asignados
+    const u = await pool.query('SELECT correo FROM usuarios WHERE id=$1', [req.params.id]);
+    if (u.rows.length) {
+      const correo = u.rows[0].correo;
+      // Liberar collares: quedan sin dueño y se pueden reasignar a otro cliente
+      await pool.query('DELETE FROM collar_dueno WHERE dueno=$1', [correo]);
+    }
     await pool.query('DELETE FROM usuarios WHERE id=$1', [req.params.id]);
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
