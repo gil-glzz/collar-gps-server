@@ -140,7 +140,9 @@ async function initDB() {
       lng     DOUBLE PRECISION,
       mensaje TEXT,
       leida   BOOLEAN DEFAULT false,
-      ts      TIMESTAMPTZ DEFAULT NOW()
+      ts      TIMESTAMPTZ DEFAULT NOW(),
+      ts_fin  TIMESTAMPTZ DEFAULT NOW(),
+      conteo  INT DEFAULT 1
     );
 
     CREATE TABLE IF NOT EXISTS config_collares (
@@ -203,7 +205,10 @@ async function initDB() {
     `ALTER TABLE geovallas ADD COLUMN IF NOT EXISTS expira_en TIMESTAMPTZ`,
     `ALTER TABLE geovallas ADD COLUMN IF NOT EXISTS creada_por TEXT DEFAULT 'app'`,
     `ALTER TABLE geovallas ADD COLUMN IF NOT EXISTS updated TIMESTAMPTZ DEFAULT NOW()`,
-    `ALTER TABLE geovallas ADD COLUMN IF NOT EXISTS dueno TEXT DEFAULT 'default'`
+    `ALTER TABLE geovallas ADD COLUMN IF NOT EXISTS dueno TEXT DEFAULT 'default'`,
+    // Alertas: agrupar por episodio (ts = inicio, ts_fin = última vez visto)
+    `ALTER TABLE alertas ADD COLUMN IF NOT EXISTS ts_fin TIMESTAMPTZ DEFAULT NOW()`,
+    `ALTER TABLE alertas ADD COLUMN IF NOT EXISTS conteo INT DEFAULT 1`
   ];
   for (const m of migraciones) {
     try { await pool.query(m); }
@@ -253,20 +258,42 @@ app.post('/gps', async (req, res) => {
     `, [device, lat, lng, speed, sats, rssi, estado,
         dist_borde, movimiento, aceleracion, actividad_s, shock_pwr]);
 
-    // Registrar alerta si es cruce o aviso
+    // ── Alertas por EPISODIO (no una nueva cada 5 segundos) ──
+    // Si el collar sigue en el mismo estado (warn/shock), en vez de crear
+    // una alerta nueva, actualizamos la última de ese tipo extendiendo su
+    // hora de fin. Así una sola alerta muestra cuánto duró el episodio.
+    // Solo se crea una alerta NUEVA si pasaron más de 5 minutos desde la
+    // última del mismo tipo (= el animal salió de ese estado un rato).
     if (estado === 'shock' || estado === 'warn') {
-      await pool.query(`
-        INSERT INTO alertas (device, tipo, lat, lng, mensaje)
-        VALUES ($1, $2, $3, $4, $5)
-      `, [
-        device,
-        estado,
-        lat,
-        lng,
-        estado === 'shock'
-          ? `${device} cruzó la cerca`
-          : `${device} se acercó al límite (${dist_borde.toFixed(0)}m)`
-      ]);
+      const VENTANA_MIN = 5;  // minutos sin reportar para considerar episodio nuevo
+      const mensaje = estado === 'shock'
+        ? `${device} cruzó la cerca`
+        : `${device} se acercó al límite (${dist_borde.toFixed(0)}m)`;
+
+      // ¿Hay un episodio reciente del mismo tipo aún "vivo"?
+      const reciente = await pool.query(`
+        SELECT id FROM alertas
+        WHERE device = $1 AND tipo = $2
+          AND ts_fin > NOW() - INTERVAL '${VENTANA_MIN} minutes'
+        ORDER BY ts_fin DESC
+        LIMIT 1
+      `, [device, estado]);
+
+      if (reciente.rows.length > 0) {
+        // Mismo episodio: extender la duración (ts_fin) y sumar al conteo.
+        await pool.query(`
+          UPDATE alertas
+          SET ts_fin = NOW(), conteo = conteo + 1,
+              lat = $2, lng = $3, mensaje = $4
+          WHERE id = $1
+        `, [reciente.rows[0].id, lat, lng, mensaje]);
+      } else {
+        // Episodio nuevo: crear alerta (ts = inicio, ts_fin = ahora).
+        await pool.query(`
+          INSERT INTO alertas (device, tipo, lat, lng, mensaje)
+          VALUES ($1, $2, $3, $4, $5)
+        `, [device, estado, lat, lng, mensaje]);
+      }
     }
 
     res.json({ ok: true });
@@ -545,7 +572,7 @@ app.get('/alertas', requireAuth, async (req, res) => {
       query += ' AND a.leida = false';
     }
     params.push(Math.min(parseInt(limit), 500));
-    query += ` ORDER BY a.ts DESC LIMIT $${params.length}`;
+    query += ` ORDER BY a.ts_fin DESC LIMIT $${params.length}`;
 
     const { rows } = await pool.query(query, params);
     res.json(rows);
