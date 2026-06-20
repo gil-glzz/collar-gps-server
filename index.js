@@ -89,6 +89,17 @@ async function correoDeUsuario(userId) {
   return rows.length ? rows[0].correo : null;
 }
 
+// ── Distancia entre dos coordenadas en metros (Haversine) ─────
+function distanciaMetros(lat1, lng1, lat2, lng2) {
+  const R = 6371000;
+  const toRad = d => d * Math.PI / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a = Math.sin(dLat/2)**2 +
+            Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng/2)**2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
 // ── Inicializar tablas al arrancar ───────────────────────────
 async function initDB() {
   await pool.query(`
@@ -189,9 +200,28 @@ async function initDB() {
       dueno  TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS aguajes (
+      id      SERIAL PRIMARY KEY,
+      dueno   TEXT NOT NULL,
+      nombre  TEXT NOT NULL DEFAULT 'Aguaje',
+      lat     DOUBLE PRECISION NOT NULL,
+      lng     DOUBLE PRECISION NOT NULL,
+      radio_m REAL DEFAULT 20,
+      created TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS visitas_aguaje (
+      id        SERIAL PRIMARY KEY,
+      aguaje_id INT NOT NULL,
+      device    TEXT NOT NULL,
+      ts        TIMESTAMPTZ DEFAULT NOW(),
+      ts_fin    TIMESTAMPTZ DEFAULT NOW()
+    );
+
     CREATE INDEX IF NOT EXISTS idx_pos_device ON posiciones(device);
     CREATE INDEX IF NOT EXISTS idx_pos_ts     ON posiciones(ts DESC);
     CREATE INDEX IF NOT EXISTS idx_alertas_ts ON alertas(ts DESC);
+    CREATE INDEX IF NOT EXISTS idx_visitas_ts ON visitas_aguaje(ts DESC);
   `);
 
   // ── Migraciones: agregar columnas que falten en tablas ya creadas ──
@@ -199,7 +229,7 @@ async function initDB() {
   // estas líneas agregan las columnas nuevas sin borrar datos.
   const migraciones = [
     `ALTER TABLE geovallas ADD COLUMN IF NOT EXISTS tipo TEXT NOT NULL DEFAULT 'permanente'`,
-    `ALTER TABLE geovallas ADD COLUMN IF NOT EXISTS warn_dist_m REAL DEFAULT 12`,
+    `ALTER TABLE geovallas ADD COLUMN IF NOT EXISTS warn_dist_m REAL DEFAULT 10`,
     `ALTER TABLE geovallas ADD COLUMN IF NOT EXISTS color TEXT DEFAULT '#1D9E75'`,
     `ALTER TABLE geovallas ADD COLUMN IF NOT EXISTS collares JSONB DEFAULT '[]'`,
     `ALTER TABLE geovallas ADD COLUMN IF NOT EXISTS expira_en TIMESTAMPTZ`,
@@ -296,6 +326,35 @@ app.post('/gps', async (req, res) => {
       }
     }
 
+    // ── Conteo de VISITAS A AGUAJES ──────────────────────────
+    // Si el collar está dentro del radio de un aguaje de su dueño y no
+    // tenía una visita "viva" (últimos 10 min) a ese aguaje, se registra
+    // una visita nueva. Si ya estaba, solo se extiende. Así contamos
+    // visitas reales (no una por cada reporte de GPS).
+    try {
+      const og = await pool.query('SELECT dueno FROM collar_dueno WHERE device = $1', [device]);
+      if (og.rows.length) {
+        const ags = await pool.query('SELECT id, lat, lng, radio_m FROM aguajes WHERE dueno = $1', [og.rows[0].dueno]);
+        for (const ag of ags.rows) {
+          const d = distanciaMetros(lat, lng, ag.lat, ag.lng);
+          if (d <= (ag.radio_m || 20)) {
+            const v = await pool.query(`
+              SELECT id FROM visitas_aguaje
+              WHERE aguaje_id = $1 AND device = $2
+                AND ts_fin > NOW() - INTERVAL '10 minutes'
+              ORDER BY ts_fin DESC LIMIT 1
+            `, [ag.id, device]);
+            if (v.rows.length) {
+              await pool.query('UPDATE visitas_aguaje SET ts_fin = NOW() WHERE id = $1', [v.rows[0].id]);
+            } else {
+              await pool.query('INSERT INTO visitas_aguaje (aguaje_id, device) VALUES ($1, $2)', [ag.id, device]);
+            }
+            break;  // contar solo el aguaje más cercano en el que está
+          }
+        }
+      }
+    } catch(e) { console.log('visita aguaje:', e.message); }
+
     res.json({ ok: true });
   } catch (err) {
     console.error('POST /gps error:', err.message);
@@ -335,6 +394,22 @@ app.get('/geovallas', async (req, res) => {
       const { rows } = await pool.query(query, params);
       return res.json(rows);
     }
+    // Gateway (sin token): si manda ?device, acotar SOLO al dueño de ese
+    // collar. Antes devolvía TODAS las cercas activas de todos los ranchos,
+    // y el gateway las mezclaba en un polígono deforme → falsos "fuera".
+    if (device) {
+      const og = await pool.query('SELECT dueno FROM collar_dueno WHERE device = $1', [device]);
+      if (og.rows.length > 0) {
+        const { rows } = await pool.query(`
+          SELECT * FROM geovallas
+          WHERE dueno = $1 AND activa = true AND tipo <> 'simbolica'
+            AND (collares = '[]'::jsonb OR collares @> $2::jsonb)
+          ORDER BY tipo DESC, id DESC
+        `, [og.rows[0].dueno, JSON.stringify([device])]);
+        return res.json(rows);
+      }
+      // Si el collar no tiene dueño asignado, cae al comportamiento viejo.
+    }
     if (todas !== 'true') {
       query += ' WHERE activa = true';
     }
@@ -362,7 +437,7 @@ app.post('/geovallas', async (req, res) => {
     nombre      = 'potrero',
     tipo        = 'permanente',
     poligono,
-    warn_dist_m = 12,
+    warn_dist_m = 10,
     color       = '#1D9E75',
     collares    = [],
     horas,
@@ -371,7 +446,7 @@ app.post('/geovallas', async (req, res) => {
 
   if (!poligono || !Array.isArray(poligono) || poligono.length < 3)
     return res.status(400).json({ error: 'poligono necesita al menos 3 puntos' });
-  if (!['permanente','temporal','exclusion'].includes(tipo))
+  if (!['permanente','temporal','exclusion','simbolica'].includes(tipo))
     return res.status(400).json({ error: 'tipo invalido' });
 
   let expiraCalc = null;
@@ -454,6 +529,94 @@ app.delete('/geovallas/:id', async (req, res) => {
     await pool.query('UPDATE geovallas SET activa=false,updated=NOW() WHERE id=$1',[req.params.id]);
     await pool.query('INSERT INTO historial_cercas (valla_id,accion) VALUES ($1,$2)',[req.params.id,'desactivada']);
     res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ═════════════════════════════════════════════════════════════
+//  AGUAJES (puntos de agua: lago, tanque, pozo)
+// ═════════════════════════════════════════════════════════════
+app.get('/aguajes', requireAuth, async (req, res) => {
+  try {
+    const dueno = await correoDeUsuario(req.userId);
+    const { rows } = await pool.query(
+      'SELECT * FROM aguajes WHERE dueno = $1 ORDER BY id DESC', [dueno]);
+    res.json(rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/aguajes', requireAuth, async (req, res) => {
+  const { nombre = 'Aguaje', lat, lng, radio_m = 20 } = req.body;
+  if (lat == null || lng == null) return res.status(400).json({ error: 'lat y lng requeridos' });
+  try {
+    const dueno = await correoDeUsuario(req.userId);
+    const { rows } = await pool.query(
+      'INSERT INTO aguajes (dueno,nombre,lat,lng,radio_m) VALUES ($1,$2,$3,$4,$5) RETURNING *',
+      [dueno, nombre, lat, lng, radio_m]);
+    res.json({ ok: true, aguaje: rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/aguajes/:id', requireAuth, async (req, res) => {
+  try {
+    const dueno = await correoDeUsuario(req.userId);
+    await pool.query('DELETE FROM aguajes WHERE id = $1 AND dueno = $2', [req.params.id, dueno]);
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ═════════════════════════════════════════════════════════════
+//  GET /reporte-diario — resumen del día para el rancho
+// ═════════════════════════════════════════════════════════════
+app.get('/reporte-diario', requireAuth, async (req, res) => {
+  try {
+    const dueno = await correoDeUsuario(req.userId);
+    // Collares del rancho
+    const cols = await pool.query('SELECT device FROM collar_dueno WHERE dueno = $1', [dueno]);
+    const devices = cols.rows.map(r => r.device);
+
+    // Alertas de hoy (cruces y avisos)
+    let cruces = 0, avisos = 0;
+    if (devices.length) {
+      const al = await pool.query(`
+        SELECT tipo, COUNT(*)::int AS n FROM alertas
+        WHERE device = ANY($1) AND ts >= CURRENT_DATE
+        GROUP BY tipo
+      `, [devices]);
+      al.rows.forEach(r => {
+        if (r.tipo === 'shock') cruces = r.n;
+        if (r.tipo === 'warn')  avisos = r.n;
+      });
+    }
+
+    // Visitas a aguajes hoy, por aguaje
+    const visitas = await pool.query(`
+      SELECT a.nombre, COUNT(v.id)::int AS visitas
+      FROM aguajes a
+      LEFT JOIN visitas_aguaje v
+        ON v.aguaje_id = a.id AND v.ts >= CURRENT_DATE
+      WHERE a.dueno = $1
+      GROUP BY a.id, a.nombre
+      ORDER BY visitas DESC
+    `, [dueno]);
+
+    // Última batería y estado por collar
+    let collares = [];
+    if (devices.length) {
+      const ult = await pool.query(`
+        SELECT DISTINCT ON (device) device, estado, shock_pwr, ts
+        FROM posiciones
+        WHERE device = ANY($1)
+        ORDER BY device, ts DESC
+      `, [devices]);
+      collares = ult.rows;
+    }
+
+    res.json({
+      fecha: new Date().toISOString().slice(0,10),
+      cruces, avisos,
+      aguajes: visitas.rows,
+      collares
+    });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
