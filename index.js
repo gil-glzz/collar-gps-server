@@ -312,7 +312,7 @@ app.get('/geovallas', async (req, res) => {
       query += ' WHERE activa = true';
     }
     if (device) {
-      const cond = toda !== 'true' ? ' AND' : ' WHERE';
+      const cond = todas !== 'true' ? ' AND' : ' WHERE';
       query += `${cond} (collares = '[]'::jsonb OR collares @> $1::jsonb)`;
       params.push(JSON.stringify([device]));
     }
@@ -449,13 +449,13 @@ app.get('/geovallas/historial', async (req, res) => {
 //  GET /historial?device=collar_01&limit=100
 //  Devuelve las últimas N posiciones de un collar
 // ─────────────────────────────────────────────────────────────
-app.get('/historial', async (req, res) => {
+app.get('/historial', requireAuth, async (req, res) => {
   const { device, limit = 100 } = req.query;
   if (!device) return res.status(400).json({ error: 'device requerido' });
 
   try {
     const { rows } = await pool.query(`
-      SELECT * FROM posiciones
+      SELECT lat, lng, ts, estado, sats FROM posiciones
       WHERE device = $1
       ORDER BY ts DESC
       LIMIT $2
@@ -525,24 +525,28 @@ app.post('/config', async (req, res) => {
 //  GET /alertas?limit=50&device=collar_01&no_leidas=true
 //  Devuelve alertas recientes para el dashboard
 // ─────────────────────────────────────────────────────────────
-app.get('/alertas', async (req, res) => {
+app.get('/alertas', requireAuth, async (req, res) => {
   const { device, limit = 50, no_leidas } = req.query;
-
-  let query = 'SELECT * FROM alertas WHERE 1=1';
-  const params = [];
-
-  if (device) {
-    params.push(device);
-    query += ` AND device = $${params.length}`;
-  }
-  if (no_leidas === 'true') {
-    query += ' AND leida = false';
-  }
-
-  params.push(Math.min(parseInt(limit), 500));
-  query += ` ORDER BY ts DESC LIMIT $${params.length}`;
-
   try {
+    const dueno = await correoDeUsuario(req.userId);
+    // Solo alertas de los collares que pertenecen a este rancho
+    let query = `
+      SELECT a.* FROM alertas a
+      JOIN collar_dueno cd ON cd.device = a.device
+      WHERE cd.dueno = $1
+    `;
+    const params = [dueno];
+
+    if (device) {
+      params.push(device);
+      query += ` AND a.device = $${params.length}`;
+    }
+    if (no_leidas === 'true') {
+      query += ' AND a.leida = false';
+    }
+    params.push(Math.min(parseInt(limit), 500));
+    query += ` ORDER BY a.ts DESC LIMIT $${params.length}`;
+
     const { rows } = await pool.query(query, params);
     res.json(rows);
   } catch (err) {
