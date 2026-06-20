@@ -760,6 +760,32 @@ app.post('/admin/asignar-collar', requireAdmin, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────
+//  GET /admin/collares-asignados — lista todas las asignaciones
+// ─────────────────────────────────────────────────────────────
+app.get('/admin/collares-asignados', requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT cd.device, cd.dueno, u.rancho
+      FROM collar_dueno cd
+      LEFT JOIN usuarios u ON u.correo = cd.dueno
+      ORDER BY cd.device
+    `);
+    res.json(rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ─────────────────────────────────────────────────────────────
+//  DELETE /admin/asignar-collar/:device — quitar una asignación
+// ─────────────────────────────────────────────────────────────
+app.delete('/admin/asignar-collar/:device', requireAdmin, async (req, res) => {
+  const { device } = req.params;
+  try {
+    await pool.query('DELETE FROM collar_dueno WHERE device = $1', [device]);
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ─────────────────────────────────────────────────────────────
 app.listen(port, async () => {
   await initDB();
   console.log(`\n🚀 CollarGPS Server v3 en puerto ${port}`);
