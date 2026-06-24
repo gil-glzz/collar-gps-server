@@ -117,8 +117,13 @@ async function initDB() {
       aceleracion REAL    DEFAULT 0,
       actividad_s BIGINT  DEFAULT 0,
       shock_pwr   INT     DEFAULT 200,
+      bateria     INT     DEFAULT 100,
+      carga       INT     DEFAULT 0,
       ts          TIMESTAMPTZ DEFAULT NOW()
     );
+
+    ALTER TABLE posiciones ADD COLUMN IF NOT EXISTS bateria INT DEFAULT 100;
+    ALTER TABLE posiciones ADD COLUMN IF NOT EXISTS carga   INT DEFAULT 0;
 
     CREATE TABLE IF NOT EXISTS geovallas (
       id            SERIAL PRIMARY KEY,
@@ -272,7 +277,9 @@ app.post('/gps', async (req, res) => {
     movimiento  = false,
     aceleracion = 0,
     actividad_s = 0,
-    shock_pwr   = 200
+    shock_pwr   = 200,
+    bateria     = 100,
+    carga       = 0
   } = req.body;
 
   if (!device || lat == null || lng == null) {
@@ -283,10 +290,10 @@ app.post('/gps', async (req, res) => {
     await pool.query(`
       INSERT INTO posiciones
         (device, lat, lng, speed, sats, rssi, estado,
-         dist_borde, movimiento, aceleracion, actividad_s, shock_pwr)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+         dist_borde, movimiento, aceleracion, actividad_s, shock_pwr, bateria, carga)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
     `, [device, lat, lng, speed, sats, rssi, estado,
-        dist_borde, movimiento, aceleracion, actividad_s, shock_pwr]);
+        dist_borde, movimiento, aceleracion, actividad_s, shock_pwr, bateria, carga]);
 
     // ── Alertas por EPISODIO (no una nueva cada 5 segundos) ──
     // Si el collar sigue en el mismo estado (warn/shock), en vez de crear
@@ -797,7 +804,7 @@ app.get('/collares', requireAuth, async (req, res) => {
     const { rows } = await pool.query(`
       SELECT DISTINCT ON (p.device)
         p.device, p.lat, p.lng, p.estado, p.movimiento,
-        p.aceleracion, p.shock_pwr, p.sats, p.rssi, p.dist_borde, p.ts
+        p.aceleracion, p.shock_pwr, p.sats, p.rssi, p.dist_borde, p.bateria, p.carga, p.ts
       FROM posiciones p
       JOIN collar_dueno cd ON cd.device = p.device
       WHERE cd.dueno = $1
