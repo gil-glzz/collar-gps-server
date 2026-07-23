@@ -464,7 +464,19 @@ async function initDB() {
     `CREATE INDEX IF NOT EXISTS idx_animales_dueno    ON animales(dueno)`,
     `CREATE INDEX IF NOT EXISTS idx_lotes_dueno       ON lotes(dueno)`,
     `CREATE INDEX IF NOT EXISTS idx_collardueno_dueno ON collar_dueno(dueno)`,
-    `CREATE INDEX IF NOT EXISTS idx_arreo_dueno_activo ON modo_arreo(dueno, activo)`
+    `CREATE INDEX IF NOT EXISTS idx_arreo_dueno_activo ON modo_arreo(dueno, activo)`,
+    // Integridad referencial (id-based, segura). NOT VALID: no valida filas
+    // existentes (evita fallar por huérfanos previos) pero SÍ enforcea inserts
+    // nuevos. Idempotente vía pg_constraint. El servidor neutraliza lote inválido
+    // a NULL en POST /animales, así que esta FK no puede romper el alta de animales.
+    // NO se agregan FKs de 'dueno' (el sentinel 'default' rompería inserts sin
+    // asignar) ni de visitas_aguaje (su CASCADE borraría historial en silencio).
+    `DO $$ BEGIN
+       IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_animales_lote') THEN
+         ALTER TABLE animales ADD CONSTRAINT fk_animales_lote
+           FOREIGN KEY (lote) REFERENCES lotes(id) ON DELETE SET NULL NOT VALID;
+       END IF;
+     END $$;`
   ];
   for (const m of migraciones) {
     try { await pool.query(m); }
@@ -1154,6 +1166,13 @@ app.post('/animales', requireAuth, async (req, res) => {
   if (!a || !a.id) return res.status(400).json({ error: 'falta id' });
   try {
     const dueno = await correoDeUsuario(req.userId);
+    // Neutraliza lote inválido o de otro dueño: solo acepta un lote existente del
+    // dueño; si no, NULL (evita FK rota, referencias colgantes y cross-rancho).
+    let lote = null;
+    if (a.lote) {
+      const lv = await pool.query('SELECT 1 FROM lotes WHERE id=$1 AND dueno=$2', [a.lote, dueno]);
+      if (lv.rows.length) lote = a.lote;
+    }
     const { rows } = await pool.query(`
       INSERT INTO animales (id,nombre,collar,arete,peso,edad,raza,sexo,lote,notas,dueno,updated)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
@@ -1163,7 +1182,7 @@ app.post('/animales', requireAuth, async (req, res) => {
       WHERE animales.dueno=$11
       RETURNING *
     `, [a.id, a.nombre||'Sin nombre', a.collar||'', a.arete||'',
-        a.peso||0, a.edad||0, a.raza||'', a.sexo||'', a.lote||null, a.notas||'', dueno]);
+        a.peso||0, a.edad||0, a.raza||'', a.sexo||'', lote, a.notas||'', dueno]);
     res.json({ ok: true, animal: rows[0] });
   } catch (err) { fail500(res, err); }
 });
