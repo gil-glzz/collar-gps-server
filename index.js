@@ -251,13 +251,17 @@ async function flagArreoParaDevice(device, dueno) {
   const v = await pool.query(
     'SELECT poligono FROM geovallas WHERE id=$1', [a.destino_valla_id]);
   if (!v.rows.length) return 1;
+  // Histéresis anti-ruido: solo apaga el arreo (0) si las ÚLTIMAS 3 posiciones
+  // no-históricas están TODAS dentro del destino. Un fix aislado no termina la
+  // protección (dirección segura: ante duda, mantiene el arreo = sin estímulo).
   const p = await pool.query(`
     SELECT lat, lng FROM posiciones
     WHERE device = $1 AND historico IS NOT TRUE
-    ORDER BY ts DESC LIMIT 1
+    ORDER BY ts DESC LIMIT 3
   `, [device]);
-  if (!p.rows.length) return 1;
-  return puntoEnPoligonoSrv(p.rows[0].lat, p.rows[0].lng, v.rows[0].poligono) ? 0 : 1;
+  if (p.rows.length < 3) return 1;   // aún sin suficientes fixes: proteger
+  const todasDentro = p.rows.every(r => puntoEnPoligonoSrv(r.lat, r.lng, v.rows[0].poligono));
+  return todasDentro ? 0 : 1;
 }
 
 // ── Inicializar tablas al arrancar ───────────────────────────
@@ -918,14 +922,20 @@ app.get('/reporte-diario', requireAuth, async (req, res) => {
 // ─────────────────────────────────────────────────────────────
 //  GET /geovallas/historial?valla_id=1
 // ─────────────────────────────────────────────────────────────
-app.get('/geovallas/historial', async (req, res) => {
+app.get('/geovallas/historial', requireAuth, async (req, res) => {
   const { valla_id } = req.query;
   try {
+    // Solo historial de cercas del dueño del token.
+    const dueno = await correoDeUsuario(req.userId);
+    const params = [dueno];
+    let where = 'WHERE g.dueno = $1';
+    const vid = parseInt(valla_id);
+    if (valla_id && Number.isInteger(vid)) { params.push(vid); where += ` AND h.valla_id = $${params.length}`; }
     const { rows } = await pool.query(`
       SELECT h.*,g.nombre FROM historial_cercas h
       JOIN geovallas g ON h.valla_id=g.id
-      ${valla_id?'WHERE h.valla_id=$1':''} ORDER BY h.ts DESC LIMIT 50
-    `, valla_id?[valla_id]:[]);
+      ${where} ORDER BY h.ts DESC LIMIT 50
+    `, params);
     res.json(rows);
   } catch (err) { fail500(res, err); }
 });
@@ -937,14 +947,18 @@ app.get('/geovallas/historial', async (req, res) => {
 app.get('/historial', requireAuth, async (req, res) => {
   const { device, limit = 100 } = req.query;
   if (!device) return res.status(400).json({ error: 'device requerido' });
+  const lim = Math.min(Math.max(parseInt(limit) || 100, 1), 1000);   // guarda NaN/límite
 
   try {
+    // IDOR: solo el historial de devices del DUEÑO del token (JOIN collar_dueno).
+    const dueno = await correoDeUsuario(req.userId);
     const { rows } = await pool.query(`
-      SELECT lat, lng, ts, estado, sats FROM posiciones
-      WHERE device = $1
-      ORDER BY ts DESC
-      LIMIT $2
-    `, [device, Math.min(parseInt(limit), 1000)]);
+      SELECT p.lat, p.lng, p.ts, p.estado, p.sats FROM posiciones p
+      JOIN collar_dueno cd ON cd.device = p.device
+      WHERE p.device = $1 AND cd.dueno = $2
+      ORDER BY p.ts DESC
+      LIMIT $3
+    `, [device, dueno, lim]);
     res.json(rows);
   } catch (err) {
     fail500(res, err);
@@ -1049,9 +1063,15 @@ app.get('/alertas', requireAuth, async (req, res) => {
 // ─────────────────────────────────────────────────────────────
 //  POST /alertas/:id/leer  — marcar alerta como leída
 // ─────────────────────────────────────────────────────────────
-app.post('/alertas/:id/leer', async (req, res) => {
+app.post('/alertas/:id/leer', requireAuth, async (req, res) => {
+  const id = parseInt(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'id inválido' });
   try {
-    await pool.query('UPDATE alertas SET leida=true WHERE id=$1', [req.params.id]);
+    const dueno = await correoDeUsuario(req.userId);
+    // Solo marca leídas las alertas de devices del dueño del token.
+    await pool.query(`UPDATE alertas SET leida=true
+      WHERE id=$1 AND device IN (SELECT device FROM collar_dueno WHERE dueno=$2)`,
+      [id, dueno]);
     res.json({ ok: true });
   } catch (err) {
     fail500(res, err);
@@ -1063,11 +1083,16 @@ app.post('/alertas/:id/leer', async (req, res) => {
 //  Métricas de actividad del acelerómetro — útil para el
 //  dashboard de bienestar animal y heatmaps
 // ─────────────────────────────────────────────────────────────
-app.get('/actividad', async (req, res) => {
+app.get('/actividad', requireAuth, async (req, res) => {
   const { device, dias = 7 } = req.query;
   if (!device) return res.status(400).json({ error: 'device requerido' });
+  const d = Math.min(Math.max(parseInt(dias) || 7, 1), 90);   // guarda NaN/rango
 
   try {
+    // Solo actividad de un device del dueño del token.
+    const dueno = await correoDeUsuario(req.userId);
+    const own = await pool.query('SELECT 1 FROM collar_dueno WHERE device=$1 AND dueno=$2', [device, dueno]);
+    if (!own.rows.length) return res.json([]);
     const { rows } = await pool.query(`
       SELECT
         DATE_TRUNC('hour', ts)      AS hora,
@@ -1083,7 +1108,7 @@ app.get('/actividad', async (req, res) => {
         AND ts > NOW() - INTERVAL '1 day' * $2
       GROUP BY DATE_TRUNC('hour', ts)
       ORDER BY hora DESC
-    `, [device, parseInt(dias)]);
+    `, [device, d]);
     res.json(rows);
   } catch (err) {
     fail500(res, err);
