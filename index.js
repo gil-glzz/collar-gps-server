@@ -47,6 +47,10 @@ const ADMIN_PASSWORD    = requireSecret('ADMIN_PASSWORD', 8);
 const TOKEN_TTL_MS  = (Number(process.env.TOKEN_TTL_DAYS) || 30) * 24 * 60 * 60 * 1000;
 const SHOCK_PWR_MAX = Math.min(255, Math.max(0, Number(process.env.SHOCK_PWR_MAX) || 255));
 const RETENCION_DIAS = Number(process.env.RETENCION_DIAS) || 0;   // 0 = sin purga automática
+// Clave de dispositivo (gateway/collar) para /gps y /salud. Si NO está definida, la
+// validación se OMITE (rollout seguro: desplegar código → flashear gateway con la clave
+// → setear esta variable en Render para ACTIVAR la exigencia sin romper el gateway).
+const DEVICE_API_KEY = process.env.DEVICE_API_KEY || '';
 
 app.set('trust proxy', 1);   // detrás del proxy de Render: obtener la IP real
 app.use(cors());
@@ -173,6 +177,16 @@ function requireAuth(req, res, next) {
 function requireAdmin(req, res, next) {
   if (!safeEqual(req.headers['x-admin-password'] || '', ADMIN_PASSWORD)) {
     return res.status(403).json({ error: 'admin requerido' });
+  }
+  next();
+}
+// Autenticación de dispositivo (gateway) para la ingesta /gps y /salud.
+// Gated por DEVICE_API_KEY: sin ella definida es no-op (no rompe el gateway durante
+// el rollout); con ella, exige el header X-Device-Key (comparación en tiempo constante).
+function requireDevice(req, res, next) {
+  if (!DEVICE_API_KEY) return next();
+  if (!safeEqual(req.headers['x-device-key'] || '', DEVICE_API_KEY)) {
+    return res.status(401).json({ error: 'dispositivo no autorizado' });
   }
   next();
 }
@@ -475,7 +489,7 @@ app.get('/health', async (req, res) => {
 //          dist_borde, movimiento, aceleracion, actividad_s,
 //          shock_pwr }
 // ─────────────────────────────────────────────────────────────
-app.post('/gps', async (req, res) => {
+app.post('/gps', requireDevice, async (req, res) => {
   const {
     device, lat, lng,
     speed       = 0,
@@ -1176,7 +1190,7 @@ app.delete('/lotes/:id', requireAuth, async (req, res) => {
 //  v6 · POST /salud — el gateway sube el paquete de salud del collar
 //  (sin auth: es un endpoint de dispositivo, igual que /gps)
 // ─────────────────────────────────────────────────────────────
-app.post('/salud', async (req, res) => {
+app.post('/salud', requireDevice, async (req, res) => {
   const {
     device,
     uptime_min = 0, bateria = 0, bateria_mv = 0, carga = 0,
