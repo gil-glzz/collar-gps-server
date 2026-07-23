@@ -46,9 +46,21 @@ const ADMIN_PASSWORD    = requireSecret('ADMIN_PASSWORD', 8);
 // Caducidad del token de sesión y tope de seguridad de la intensidad de estímulo.
 const TOKEN_TTL_MS  = (Number(process.env.TOKEN_TTL_DAYS) || 30) * 24 * 60 * 60 * 1000;
 const SHOCK_PWR_MAX = Math.min(255, Math.max(0, Number(process.env.SHOCK_PWR_MAX) || 255));
+const RETENCION_DIAS = Number(process.env.RETENCION_DIAS) || 0;   // 0 = sin purga automática
 
+app.set('trust proxy', 1);   // detrás del proxy de Render: obtener la IP real
 app.use(cors());
 app.use(express.json({ limit: '256kb' }));
+
+// Cabeceras de seguridad (equivalente ligero a helmet, sin dependencias).
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('X-DNS-Prefetch-Control', 'off');
+  if (IS_PROD) res.setHeader('Strict-Transport-Security', 'max-age=15552000; includeSubDomains');
+  next();
+});
 
 // ── PostgreSQL ───────────────────────────────────────────────
 const pool = new Pool({
@@ -67,6 +79,47 @@ pool.on('error', (err) => {
 function fail500(res, err) {
   console.error(err);
   return res.status(500).json({ error: 'error interno del servidor' });
+}
+
+// Rate-limit simple en memoria (Render free = 1 instancia).
+// La IP viene de req.ip (correcto con trust proxy=1); NO se lee X-Forwarded-For
+// crudo porque su primer elemento es falsificable por el cliente.
+function rateLimit({ max, windowMs, msg, keyFn }) {
+  const hits = new Map();
+  // Barrido temporal de expiradas (no depende del tamaño); unref para no
+  // mantener vivo el proceso por sí solo.
+  const t = setInterval(() => {
+    const now = Date.now();
+    for (const [k, v] of hits) if (now - v.start > windowMs) hits.delete(k);
+  }, windowMs);
+  if (t.unref) t.unref();
+  return (req, res, next) => {
+    const now = Date.now();
+    if (hits.size > 20000) hits.clear();   // tope duro anti-OOM bajo abuso
+    const key = keyFn ? keyFn(req) : (req.ip || 'anon');
+    const rec = hits.get(key);
+    if (!rec || now - rec.start > windowMs) hits.set(key, { start: now, count: 1 });
+    else if (++rec.count > max) return res.status(429).json({ error: msg || 'demasiados intentos, espera un momento' });
+    next();
+  };
+}
+// Solo el login se limita (fuerza bruta). Los endpoints de dispositivo (/gps, /salud)
+// hacen polling frecuente y NO se limitan. Llave = IP + correo: no penaliza a varios
+// usuarios legítimos tras una misma IP (NAT/CGNAT rural), pero sí frena el ataque por cuenta.
+const loginLimiter = rateLimit({
+  max: 30, windowMs: 15 * 60 * 1000,
+  msg: 'demasiados intentos de inicio de sesión; espera unos minutos',
+  keyFn: (req) => (req.ip || 'anon') + '|' + String(req.body && req.body.correo || '').toLowerCase().trim(),
+});
+
+// Purga opcional de datos crudos antiguos (RETENCION_DIAS; 0 = desactivada).
+async function purgaRetencion() {
+  if (RETENCION_DIAS <= 0) return;
+  try {
+    const a = await pool.query(`DELETE FROM posiciones     WHERE ts < NOW() - ($1 || ' days')::interval`, [RETENCION_DIAS]);
+    const b = await pool.query(`DELETE FROM salud_collares WHERE ts < NOW() - ($1 || ' days')::interval`, [RETENCION_DIAS]);
+    console.log(`🧹 Retención ${RETENCION_DIAS}d: -${a.rowCount} posiciones, -${b.rowCount} salud`);
+  } catch (e) { console.error('purgaRetencion:', e.message); }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -224,13 +277,14 @@ async function initDB() {
       tipo          TEXT    NOT NULL DEFAULT 'permanente',
       poligono      JSONB   NOT NULL,
       activa        BOOLEAN DEFAULT true,
-      warn_dist_m   REAL    DEFAULT 12,
+      warn_dist_m   REAL    DEFAULT 10,
       color         TEXT    DEFAULT '#1D9E75',
       collares      JSONB   DEFAULT '[]',
       expira_en     TIMESTAMPTZ,
       creada_por    TEXT    DEFAULT 'app',
       created       TIMESTAMPTZ DEFAULT NOW(),
-      updated       TIMESTAMPTZ DEFAULT NOW()
+      updated       TIMESTAMPTZ DEFAULT NOW(),
+      dueno         TEXT    DEFAULT 'default'
     );
 
     CREATE TABLE IF NOT EXISTS historial_cercas (
@@ -376,7 +430,23 @@ async function initDB() {
     `ALTER TABLE posiciones ADD COLUMN IF NOT EXISTS reinicios_anormales INT DEFAULT 0`,
     `ALTER TABLE posiciones ADD COLUMN IF NOT EXISTS historico BOOLEAN DEFAULT false`,
     `ALTER TABLE posiciones ADD COLUMN IF NOT EXISTS hace_s BIGINT DEFAULT 0`,
-    `ALTER TABLE posiciones ADD COLUMN IF NOT EXISTS arreo BOOLEAN DEFAULT false`
+    `ALTER TABLE posiciones ADD COLUMN IF NOT EXISTS arreo BOOLEAN DEFAULT false`,
+    // Fase 3: índices creados DESPUÉS de agregar columnas (dueno/collares ya existen).
+    // Cada uno es su propia sentencia con try/catch en el loop: un fallo aislado no
+    // arrastra a los demás ni aborta las migraciones. Idempotentes (IF NOT EXISTS).
+    `CREATE INDEX IF NOT EXISTS idx_pos_device_ts     ON posiciones(device, ts DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_salud_device_ts   ON salud_collares(device, ts DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_alertas_device_ts ON alertas(device, ts DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_geovallas_dueno   ON geovallas(dueno)`,
+    `CREATE INDEX IF NOT EXISTS idx_geovallas_activa  ON geovallas(activa)`,
+    `CREATE INDEX IF NOT EXISTS idx_geovallas_collares_gin ON geovallas USING GIN (collares)`,
+    `CREATE INDEX IF NOT EXISTS idx_histcercas_valla  ON historial_cercas(valla_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_visitas_aguaje    ON visitas_aguaje(aguaje_id, ts_fin DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_aguajes_dueno     ON aguajes(dueno)`,
+    `CREATE INDEX IF NOT EXISTS idx_animales_dueno    ON animales(dueno)`,
+    `CREATE INDEX IF NOT EXISTS idx_lotes_dueno       ON lotes(dueno)`,
+    `CREATE INDEX IF NOT EXISTS idx_collardueno_dueno ON collar_dueno(dueno)`,
+    `CREATE INDEX IF NOT EXISTS idx_arreo_dueno_activo ON modo_arreo(dueno, activo)`
   ];
   for (const m of migraciones) {
     try { await pool.query(m); }
@@ -1253,7 +1323,7 @@ app.post('/arreo/terminar', requireAuth, async (req, res) => {
 // ─────────────────────────────────────────────────────────────
 
 // Login: correo + password → devuelve token y datos del rancho
-app.post('/login', async (req, res) => {
+app.post('/login', loginLimiter, async (req, res) => {
   const { correo, password } = req.body;
   if (!correo || !password) return res.status(400).json({ error: 'faltan datos' });
   try {
@@ -1360,6 +1430,7 @@ process.on('uncaughtException', (err) => console.error('uncaughtException:', err
 
 const server = app.listen(port, async () => {
   try { await initDB(); } catch (e) { console.error('initDB falló:', e); }
+  if (RETENCION_DIAS > 0) { purgaRetencion(); setInterval(purgaRetencion, 6 * 60 * 60 * 1000); }
   console.log(`\n🚀 CollarGPS Server v3 en puerto ${port}`);
   console.log('   Endpoints disponibles:');
   console.log('   POST /gps          — posición + IMU');
