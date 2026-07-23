@@ -22,20 +22,52 @@ const crypto    = require('crypto');   // nativo de Node, para hash de contrase�
 
 const app  = express();
 const port = process.env.PORT || 3000;
+const IS_PROD = process.env.NODE_ENV === 'production';
 
-// Contraseña de admin (para crear cuentas). Cámbiala con una variable de entorno.
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'lindero-admin-2026';
+// ── Secretos (fail-closed en producción) ─────────────────────
+//  En producción TOKEN_SIGNING_KEY y ADMIN_PASSWORD son OBLIGATORIOS: si
+//  faltan, el server NO arranca. Esto elimina el default público anterior
+//  ('lindero-admin-2026') que permitía forjar tokens de cualquier usuario.
+//  En desarrollo se generan valores efímeros y se imprimen en consola.
+function requireSecret(name) {
+  const v = process.env[name];
+  if (v && v.length >= 16) return v;
+  if (IS_PROD) {
+    console.error(`FATAL: falta la variable de entorno ${name} (mín. 16 caracteres). El server no arrancará por seguridad.`);
+    process.exit(1);
+  }
+  const gen = crypto.randomBytes(24).toString('hex');
+  console.warn(`⚠️  ${name} no definida (dev): usando valor efímero → ${gen}`);
+  return gen;
+}
+// Clave de firma de tokens, INDEPENDIENTE de la contraseña de admin.
+const TOKEN_SIGNING_KEY = requireSecret('TOKEN_SIGNING_KEY');
+const ADMIN_PASSWORD    = requireSecret('ADMIN_PASSWORD');
+// Caducidad del token de sesión y tope de seguridad de la intensidad de estímulo.
+const TOKEN_TTL_MS  = (Number(process.env.TOKEN_TTL_DAYS) || 30) * 24 * 60 * 60 * 1000;
+const SHOCK_PWR_MAX = Math.min(255, Math.max(0, Number(process.env.SHOCK_PWR_MAX) || 255));
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '256kb' }));
 
 // ── PostgreSQL ───────────────────────────────────────────────
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production'
-    ? { rejectUnauthorized: false }
-    : false
+  ssl: IS_PROD ? { rejectUnauthorized: false } : false,
+  max: Number(process.env.PG_POOL_MAX) || 10,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000
 });
+// Una desconexión del Postgres de Render NO debe tumbar el proceso.
+pool.on('error', (err) => {
+  console.error('⚠️  Error inesperado en el pool de PostgreSQL:', err.message);
+});
+
+// Responde 500 sin filtrar detalles internos (err.message) al cliente.
+function fail500(res, err) {
+  console.error(err);
+  return res.status(500).json({ error: 'error interno del servidor' });
+}
 
 // ─────────────────────────────────────────────────────────────
 //  AUTENTICACIÓN — hash de contraseñas y tokens de sesión
@@ -51,19 +83,27 @@ function verifyPassword(password, stored) {
   const test = crypto.scryptSync(password, salt, 64).toString('hex');
   return crypto.timingSafeEqual(Buffer.from(hash), Buffer.from(test));
 }
-// Token de sesión simple: id de usuario + firma. No expira (piloto).
+// Token de sesión: userId + timestamp + firma HMAC (clave dedicada), con caducidad.
 function crearToken(userId) {
   const payload = userId + '.' + Date.now();
-  const firma = crypto.createHmac('sha256', ADMIN_PASSWORD).update(payload).digest('hex');
+  const firma = crypto.createHmac('sha256', TOKEN_SIGNING_KEY).update(payload).digest('hex');
   return Buffer.from(payload + '.' + firma).toString('base64');
+}
+// Comparación de cadenas en tiempo constante (evita canal lateral de temporización).
+function safeEqual(a, b) {
+  const ba = Buffer.from(String(a)), bb = Buffer.from(String(b));
+  return ba.length === bb.length && crypto.timingSafeEqual(ba, bb);
 }
 function verificarToken(token) {
   try {
     const decoded = Buffer.from(token, 'base64').toString();
     const [userId, ts, firma] = decoded.split('.');
+    if (!userId || !ts || !firma) return null;
     const payload = userId + '.' + ts;
-    const esperada = crypto.createHmac('sha256', ADMIN_PASSWORD).update(payload).digest('hex');
-    if (firma === esperada) return userId;
+    const esperada = crypto.createHmac('sha256', TOKEN_SIGNING_KEY).update(payload).digest('hex');
+    if (!safeEqual(firma, esperada)) return null;
+    if (Date.now() - Number(ts) > TOKEN_TTL_MS) return null;   // token caducado
+    return userId;
   } catch(e) {}
   return null;
 }
@@ -78,7 +118,7 @@ function requireAuth(req, res, next) {
 }
 // Middleware: verifica la contraseña de admin (header x-admin-password)
 function requireAdmin(req, res, next) {
-  if (req.headers['x-admin-password'] !== ADMIN_PASSWORD) {
+  if (!safeEqual(req.headers['x-admin-password'] || '', ADMIN_PASSWORD)) {
     return res.status(403).json({ error: 'admin requerido' });
   }
   next();
@@ -98,6 +138,59 @@ function distanciaMetros(lat1, lng1, lat2, lng2) {
   const a = Math.sin(dLat/2)**2 +
             Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng/2)**2;
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
+// ── v6: ¿el punto está dentro del polígono? (ray casting) ─────
+function puntoEnPoligonoSrv(lat, lng, poly) {
+  if (!Array.isArray(poly) || poly.length < 3) return false;
+  let dentro = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const yi = poly[i].lat, xi = poly[i].lng;
+    const yj = poly[j].lat, xj = poly[j].lng;
+    if (((yi > lat) !== (yj > lat)) &&
+        (lng < (xj - xi) * (lat - yi) / (yj - yi) + xi)) dentro = !dentro;
+  }
+  return dentro;
+}
+
+// ── v6: arreo vigente del dueño (o null), con expiración en el servidor ──
+async function arreoVigente(dueno) {
+  const { rows } = await pool.query(`
+    SELECT * FROM modo_arreo
+    WHERE dueno = $1 AND activo = true
+    ORDER BY id DESC LIMIT 1
+  `, [dueno]);
+  if (!rows.length) return null;
+  const a = rows[0];
+  const venceEn = new Date(a.inicio).getTime() + a.duracion_min * 60000;
+  if (Date.now() > venceEn) {
+    await pool.query(
+      'UPDATE modo_arreo SET activo=false, terminado_en=NOW() WHERE id=$1', [a.id]);
+    console.log(`🐄 Arreo de ${dueno} EXPIRÓ en el servidor (${a.duracion_min} min).`);
+    return null;
+  }
+  return a;
+}
+
+// ── v6: ¿este collar debe estar en arreo AHORA? ───────────────
+// Regla Nofence: con destino, la contención del collar "se activa" en
+// cuanto ese collar registra posición DENTRO del potrero destino. Su
+// flag se apaga individualmente (los que llegaron quedan contenidos,
+// los que van en camino siguen libres de estímulo).
+async function flagArreoParaDevice(device, dueno) {
+  const a = await arreoVigente(dueno);
+  if (!a) return 0;
+  if (!a.destino_valla_id) return 1;   // arreo simple por tiempo
+  const v = await pool.query(
+    'SELECT poligono FROM geovallas WHERE id=$1', [a.destino_valla_id]);
+  if (!v.rows.length) return 1;
+  const p = await pool.query(`
+    SELECT lat, lng FROM posiciones
+    WHERE device = $1 AND historico IS NOT TRUE
+    ORDER BY ts DESC LIMIT 1
+  `, [device]);
+  if (!p.rows.length) return 1;
+  return puntoEnPoligonoSrv(p.rows[0].lat, p.rows[0].lng, v.rows[0].poligono) ? 0 : 1;
 }
 
 // ── Inicializar tablas al arrancar ───────────────────────────
@@ -223,10 +316,44 @@ async function initDB() {
       ts_fin    TIMESTAMPTZ DEFAULT NOW()
     );
 
+    -- v6: salud reportada por cada collar (paquete "sl":1 vía gateway)
+    CREATE TABLE IF NOT EXISTS salud_collares (
+      id         SERIAL PRIMARY KEY,
+      device     TEXT NOT NULL,
+      uptime_min BIGINT DEFAULT 0,
+      bateria    INT DEFAULT 0,
+      bateria_mv INT DEFAULT 0,
+      carga      INT DEFAULT 0,
+      pulsos     INT DEFAULT 0,
+      avisos     INT DEFAULT 0,
+      bloqueado  BOOLEAN DEFAULT false,
+      reinicios  INT DEFAULT 0,
+      reinicios_anormales INT DEFAULT 0,
+      entrega_pct INT DEFAULT 0,
+      respaldo   INT DEFAULT 0,
+      rssi       INT DEFAULT 0,
+      ts         TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    -- v6: modo arreo por rancho. La expiración se calcula en el servidor
+    -- al leer (inicio + duracion_min); nunca se confía en que alguien
+    -- apague el botón. destino_valla_id opcional: con destino, el flag
+    -- de cada collar se apaga solo cuando ese collar entra al potrero.
+    CREATE TABLE IF NOT EXISTS modo_arreo (
+      id               SERIAL PRIMARY KEY,
+      dueno            TEXT NOT NULL,
+      activo           BOOLEAN DEFAULT true,
+      destino_valla_id INT,
+      inicio           TIMESTAMPTZ DEFAULT NOW(),
+      duracion_min     INT DEFAULT 120,
+      terminado_en     TIMESTAMPTZ
+    );
+
     CREATE INDEX IF NOT EXISTS idx_pos_device ON posiciones(device);
     CREATE INDEX IF NOT EXISTS idx_pos_ts     ON posiciones(ts DESC);
     CREATE INDEX IF NOT EXISTS idx_alertas_ts ON alertas(ts DESC);
     CREATE INDEX IF NOT EXISTS idx_visitas_ts ON visitas_aguaje(ts DESC);
+    CREATE INDEX IF NOT EXISTS idx_salud_ts   ON salud_collares(ts DESC);
   `);
 
   // ── Migraciones: agregar columnas que falten en tablas ya creadas ──
@@ -243,7 +370,13 @@ async function initDB() {
     `ALTER TABLE geovallas ADD COLUMN IF NOT EXISTS dueno TEXT DEFAULT 'default'`,
     // Alertas: agrupar por episodio (ts = inicio, ts_fin = última vez visto)
     `ALTER TABLE alertas ADD COLUMN IF NOT EXISTS ts_fin TIMESTAMPTZ DEFAULT NOW()`,
-    `ALTER TABLE alertas ADD COLUMN IF NOT EXISTS conteo INT DEFAULT 1`
+    `ALTER TABLE alertas ADD COLUMN IF NOT EXISTS conteo INT DEFAULT 1`,
+    // v6: bienestar, diagnóstico, históricos y arreo por posición
+    `ALTER TABLE posiciones ADD COLUMN IF NOT EXISTS bloqueado BOOLEAN DEFAULT false`,
+    `ALTER TABLE posiciones ADD COLUMN IF NOT EXISTS reinicios_anormales INT DEFAULT 0`,
+    `ALTER TABLE posiciones ADD COLUMN IF NOT EXISTS historico BOOLEAN DEFAULT false`,
+    `ALTER TABLE posiciones ADD COLUMN IF NOT EXISTS hace_s BIGINT DEFAULT 0`,
+    `ALTER TABLE posiciones ADD COLUMN IF NOT EXISTS arreo BOOLEAN DEFAULT false`
   ];
   for (const m of migraciones) {
     try { await pool.query(m); }
@@ -256,8 +389,14 @@ async function initDB() {
 // ─────────────────────────────────────────────────────────────
 //  GET /health  — Render lo usa para saber si el server vive
 // ─────────────────────────────────────────────────────────────
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '3.0', ts: new Date().toISOString() });
+app.get('/health', async (req, res) => {
+  try {
+    await pool.query('SELECT 1');
+    res.json({ status: 'ok', db: 'ok', version: '3.1', ts: new Date().toISOString() });
+  } catch (err) {
+    console.error('health: la BD no responde:', err.message);
+    res.status(503).json({ status: 'degraded', db: 'down', ts: new Date().toISOString() });
+  }
 });
 
 // ─────────────────────────────────────────────────────────────
@@ -279,21 +418,37 @@ app.post('/gps', async (req, res) => {
     actividad_s = 0,
     shock_pwr   = 200,
     bateria     = 100,
-    carga       = 0
+    carga       = 0,
+    // v6: bienestar, diagnóstico, históricos y arreo
+    bloqueado   = false,
+    reinicios_anormales = 0,
+    historico   = false,
+    hace_s      = 0,
+    arreo       = false
   } = req.body;
 
-  if (!device || lat == null || lng == null) {
-    return res.status(400).json({ error: 'device, lat y lng son requeridos' });
+  const latNum = Number(lat), lngNum = Number(lng);
+  if (!device || lat == null || lng == null ||
+      !Number.isFinite(latNum) || !Number.isFinite(lngNum) ||
+      latNum < -90 || latNum > 90 || lngNum < -180 || lngNum > 180) {
+    return res.status(400).json({ error: 'device y lat/lng numéricos en rango son requeridos' });
   }
 
   try {
+    // v6: una posición histórica se guarda con SU hora real (ahora - hace_s),
+    // no con la hora en que por fin llegó. Así el mapa y los reportes ven
+    // el recorrido verdadero, en orden.
+    const haceSeg = historico ? Math.max(0, parseInt(hace_s) || 0) : 0;
     await pool.query(`
       INSERT INTO posiciones
         (device, lat, lng, speed, sats, rssi, estado,
-         dist_borde, movimiento, aceleracion, actividad_s, shock_pwr, bateria, carga)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+         dist_borde, movimiento, aceleracion, actividad_s, shock_pwr, bateria, carga,
+         bloqueado, reinicios_anormales, historico, hace_s, arreo, ts)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,
+              $15,$16,$17,$18,$19, NOW() - make_interval(secs => $20))
     `, [device, lat, lng, speed, sats, rssi, estado,
-        dist_borde, movimiento, aceleracion, actividad_s, shock_pwr, bateria, carga]);
+        dist_borde, movimiento, aceleracion, actividad_s, shock_pwr, bateria, carga,
+        !!bloqueado, parseInt(reinicios_anormales) || 0, !!historico, haceSeg, !!arreo, haceSeg]);
 
     // ── Alertas por EPISODIO (no una nueva cada 5 segundos) ──
     // Si el collar sigue en el mismo estado (warn/shock), en vez de crear
@@ -333,12 +488,39 @@ app.post('/gps', async (req, res) => {
       }
     }
 
+    // ── v6: Alerta de BLOQUEO DE BIENESTAR (episodio de 60 min) ──
+    // El collar alcanzó su límite de estímulos y pasó a solo-buzzer.
+    // Es la alerta más importante para el ranchero: ese animal requiere
+    // atención presencial.
+    if (bloqueado) {
+      const rb = await pool.query(`
+        SELECT id FROM alertas
+        WHERE device = $1 AND tipo = 'bloqueo'
+          AND ts_fin > NOW() - INTERVAL '60 minutes'
+        ORDER BY ts_fin DESC LIMIT 1
+      `, [device]);
+      if (rb.rows.length > 0) {
+        await pool.query(`
+          UPDATE alertas SET ts_fin = NOW(), conteo = conteo + 1, lat = $2, lng = $3
+          WHERE id = $1
+        `, [rb.rows[0].id, lat, lng]);
+      } else {
+        await pool.query(`
+          INSERT INTO alertas (device, tipo, lat, lng, mensaje)
+          VALUES ($1, 'bloqueo', $2, $3, $4)
+        `, [device, lat, lng,
+            `${device} alcanzó el límite de estímulos — bloqueo de bienestar activo (solo buzzer)`]);
+      }
+    }
+
     // ── Conteo de VISITAS A AGUAJES ──────────────────────────
     // Si el collar está dentro del radio de un aguaje de su dueño y no
     // tenía una visita "viva" (últimos 10 min) a ese aguaje, se registra
     // una visita nueva. Si ya estaba, solo se extiende. Así contamos
     // visitas reales (no una por cada reporte de GPS).
-    try {
+    // v6: las posiciones HISTÓRICAS no cuentan visitas (su hora real es
+    // pasada y corromperían la lógica de episodios que usa NOW()).
+    if (!historico) try {
       const og = await pool.query('SELECT dueno FROM collar_dueno WHERE device = $1', [device]);
       if (og.rows.length) {
         const ags = await pool.query('SELECT id, lat, lng, radio_m FROM aguajes WHERE dueno = $1', [og.rows[0].dueno]);
@@ -365,7 +547,7 @@ app.post('/gps', async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     console.error('POST /gps error:', err.message);
-    res.status(500).json({ error: err.message });
+    fail500(res, err);
   }
 });
 
@@ -413,7 +595,11 @@ app.get('/geovallas', async (req, res) => {
             AND (collares = '[]'::jsonb OR collares @> $2::jsonb)
           ORDER BY tipo DESC, id DESC
         `, [og.rows[0].dueno, JSON.stringify([device])]);
-        return res.json(rows);
+        // v6: incluir el flag de modo arreo en cada cerca. El gateway lo
+        // detecta buscando "arreo":1 en el texto de la respuesta y se lo
+        // renueva al collar en cada intercambio LoRa.
+        const ar = await flagArreoParaDevice(device, og.rows[0].dueno);
+        return res.json(rows.map(r => ({ ...r, arreo: ar })));
       }
       // Si el collar no tiene dueño asignado, cae al comportamiento viejo.
     }
@@ -427,9 +613,15 @@ app.get('/geovallas', async (req, res) => {
     }
     query += ' ORDER BY tipo DESC, id DESC';
     const { rows } = await pool.query(query, params);
+    // v6: si es el gateway preguntando por un collar sin dueño asignado,
+    // usar el arreo del rancho 'default'.
+    if (device) {
+      const ar = await flagArreoParaDevice(device, 'default');
+      return res.json(rows.map(r => ({ ...r, arreo: ar })));
+    }
     res.json(rows);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    fail500(res, err);
   }
 });
 
@@ -439,7 +631,14 @@ app.get('/geovallas', async (req, res) => {
 //    collares, horas, expira_en }
 //  tipo: "permanente" | "temporal" | "exclusion"
 // ─────────────────────────────────────────────────────────────
-app.post('/geovallas', async (req, res) => {
+// Valida que un polígono sea un array de ≥3 vértices {lat,lng} numéricos y en rango.
+function validarPoligono(poly) {
+  if (!Array.isArray(poly) || poly.length < 3) return false;
+  return poly.every(p => p &&
+    Number.isFinite(Number(p.lat)) && Number(p.lat) >= -90  && Number(p.lat) <= 90 &&
+    Number.isFinite(Number(p.lng)) && Number(p.lng) >= -180 && Number(p.lng) <= 180);
+}
+app.post('/geovallas', requireAuth, async (req, res) => {
   const {
     nombre      = 'potrero',
     tipo        = 'permanente',
@@ -451,8 +650,8 @@ app.post('/geovallas', async (req, res) => {
     expira_en
   } = req.body;
 
-  if (!poligono || !Array.isArray(poligono) || poligono.length < 3)
-    return res.status(400).json({ error: 'poligono necesita al menos 3 puntos' });
+  if (!validarPoligono(poligono))
+    return res.status(400).json({ error: 'poligono necesita ≥3 vértices {lat,lng} numéricos y en rango' });
   if (!['permanente','temporal','exclusion','simbolica'].includes(tipo))
     return res.status(400).json({ error: 'tipo invalido' });
 
@@ -464,10 +663,8 @@ app.post('/geovallas', async (req, res) => {
   }
 
   try {
-    // El dueño viene del token del dashboard
-    const auth = req.headers.authorization || '';
-    const userId = verificarToken(auth.replace('Bearer ', ''));
-    const dueno = userId ? await correoDeUsuario(userId) : 'default';
+    // El dueño se deriva SIEMPRE del token (requireAuth ya validó la sesión).
+    const dueno = await correoDeUsuario(req.userId);
 
     const { rows } = await pool.query(`
       INSERT INTO geovallas
@@ -483,19 +680,23 @@ app.post('/geovallas', async (req, res) => {
     console.log(`🗺️  Cerca "${nombre}" [${tipo}] dueño:${dueno}`);
     res.json({ ok: true, valla: rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    fail500(res, err);
   }
 });
 
 // ─────────────────────────────────────────────────────────────
 //  PATCH /geovallas/:id — mover polígono, extender tiempo, etc.
 // ─────────────────────────────────────────────────────────────
-app.patch('/geovallas/:id', async (req, res) => {
+app.patch('/geovallas/:id', requireAuth, async (req, res) => {
   const id = parseInt(req.params.id);
   const { nombre, poligono, activa, warn_dist_m, color,
           collares, horas_extra, expira_en } = req.body;
+  if (poligono !== undefined && !validarPoligono(poligono))
+    return res.status(400).json({ error: 'poligono necesita ≥3 vértices {lat,lng} numéricos y en rango' });
   try {
-    const { rows: cur } = await pool.query('SELECT * FROM geovallas WHERE id=$1',[id]);
+    // Solo la cerca del dueño autenticado (evita mover/editar cercas ajenas).
+    const dueno = await correoDeUsuario(req.userId);
+    const { rows: cur } = await pool.query('SELECT * FROM geovallas WHERE id=$1 AND dueno=$2',[id, dueno]);
     if (!cur.length) return res.status(404).json({ error: 'cerca no encontrada' });
     const v = cur[0];
 
@@ -525,18 +726,21 @@ app.patch('/geovallas/:id', async (req, res) => {
       [id,'modificada',JSON.stringify(req.body)]
     );
     res.json({ ok: true, valla: rows[0] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { fail500(res, err); }
 });
 
 // ─────────────────────────────────────────────────────────────
 //  DELETE /geovallas/:id — desactivar (no borra el registro)
 // ─────────────────────────────────────────────────────────────
-app.delete('/geovallas/:id', async (req, res) => {
+app.delete('/geovallas/:id', requireAuth, async (req, res) => {
   try {
-    await pool.query('UPDATE geovallas SET activa=false,updated=NOW() WHERE id=$1',[req.params.id]);
+    // Solo desactiva si la cerca pertenece al dueño autenticado.
+    const dueno = await correoDeUsuario(req.userId);
+    const r = await pool.query('UPDATE geovallas SET activa=false,updated=NOW() WHERE id=$1 AND dueno=$2',[req.params.id, dueno]);
+    if (!r.rowCount) return res.status(404).json({ error: 'cerca no encontrada' });
     await pool.query('INSERT INTO historial_cercas (valla_id,accion) VALUES ($1,$2)',[req.params.id,'desactivada']);
     res.json({ ok: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { fail500(res, err); }
 });
 
 // ═════════════════════════════════════════════════════════════
@@ -548,7 +752,7 @@ app.get('/aguajes', requireAuth, async (req, res) => {
     const { rows } = await pool.query(
       'SELECT * FROM aguajes WHERE dueno = $1 ORDER BY id DESC', [dueno]);
     res.json(rows);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { fail500(res, err); }
 });
 
 app.post('/aguajes', requireAuth, async (req, res) => {
@@ -560,7 +764,7 @@ app.post('/aguajes', requireAuth, async (req, res) => {
       'INSERT INTO aguajes (dueno,nombre,lat,lng,radio_m) VALUES ($1,$2,$3,$4,$5) RETURNING *',
       [dueno, nombre, lat, lng, radio_m]);
     res.json({ ok: true, aguaje: rows[0] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { fail500(res, err); }
 });
 
 app.delete('/aguajes/:id', requireAuth, async (req, res) => {
@@ -568,7 +772,7 @@ app.delete('/aguajes/:id', requireAuth, async (req, res) => {
     const dueno = await correoDeUsuario(req.userId);
     await pool.query('DELETE FROM aguajes WHERE id = $1 AND dueno = $2', [req.params.id, dueno]);
     res.json({ ok: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { fail500(res, err); }
 });
 
 // ═════════════════════════════════════════════════════════════
@@ -624,7 +828,7 @@ app.get('/reporte-diario', requireAuth, async (req, res) => {
       aguajes: visitas.rows,
       collares
     });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { fail500(res, err); }
 });
 
 // ─────────────────────────────────────────────────────────────
@@ -639,7 +843,7 @@ app.get('/geovallas/historial', async (req, res) => {
       ${valla_id?'WHERE h.valla_id=$1':''} ORDER BY h.ts DESC LIMIT 50
     `, valla_id?[valla_id]:[]);
     res.json(rows);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { fail500(res, err); }
 });
 
 // ─────────────────────────────────────────────────────────────
@@ -659,7 +863,7 @@ app.get('/historial', requireAuth, async (req, res) => {
     `, [device, Math.min(parseInt(limit), 1000)]);
     res.json(rows);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    fail500(res, err);
   }
 });
 
@@ -676,7 +880,7 @@ app.get('/config', async (req, res) => {
     );
     res.json(rows);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    fail500(res, err);
   }
 });
 
@@ -688,17 +892,24 @@ app.get('/config', async (req, res) => {
 //  El gateway descargará el cambio en máximo 30s y lo enviará
 //  al collar en el próximo ciclo LoRa.
 // ─────────────────────────────────────────────────────────────
-app.post('/config', async (req, res) => {
+app.post('/config', requireAuth, async (req, res) => {
   const { device, pwr, notas } = req.body;
 
   if (!device) {
     return res.status(400).json({ error: 'device es requerido' });
   }
-  if (pwr == null || pwr < 0 || pwr > 255) {
+  const pwrNum = Number(pwr);
+  if (pwr == null || !Number.isFinite(pwrNum) || pwrNum < 0 || pwrNum > 255) {
     return res.status(400).json({ error: 'pwr debe ser un entero entre 0 y 255' });
   }
+  // Tope de seguridad configurable (SHOCK_PWR_MAX): acota la intensidad de estímulo.
+  const pwrSafe = Math.min(Math.round(pwrNum), SHOCK_PWR_MAX);
 
   try {
+    // El device debe pertenecer al dueño autenticado (evita fijar estímulo ajeno).
+    const dueno = await correoDeUsuario(req.userId);
+    const owns = await pool.query('SELECT 1 FROM collar_dueno WHERE device=$1 AND dueno=$2',[device, dueno]);
+    if (!owns.rowCount) return res.status(404).json({ error: 'collar no encontrado' });
     // UPSERT — si ya existe el device lo actualiza, si no lo crea
     const { rows } = await pool.query(`
       INSERT INTO config_collares (device, shock_pwr, notas, updated)
@@ -709,12 +920,12 @@ app.post('/config', async (req, res) => {
         notas     = COALESCE(EXCLUDED.notas, config_collares.notas),
         updated   = NOW()
       RETURNING *
-    `, [device, pwr, notas || null]);
+    `, [device, pwrSafe, notas || null]);
 
-    console.log(`⚙️  Config actualizada: ${device} pwr=${pwr}`);
+    console.log(`⚙️  Config actualizada: ${device} pwr=${pwrSafe}${pwrSafe !== pwrNum ? ` (limitado desde ${pwrNum})` : ''}`);
     res.json({ ok: true, config: rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    fail500(res, err);
   }
 });
 
@@ -747,7 +958,7 @@ app.get('/alertas', requireAuth, async (req, res) => {
     const { rows } = await pool.query(query, params);
     res.json(rows);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    fail500(res, err);
   }
 });
 
@@ -759,7 +970,7 @@ app.post('/alertas/:id/leer', async (req, res) => {
     await pool.query('UPDATE alertas SET leida=true WHERE id=$1', [req.params.id]);
     res.json({ ok: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    fail500(res, err);
   }
 });
 
@@ -791,7 +1002,7 @@ app.get('/actividad', async (req, res) => {
     `, [device, parseInt(dias)]);
     res.json(rows);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    fail500(res, err);
   }
 });
 
@@ -804,7 +1015,8 @@ app.get('/collares', requireAuth, async (req, res) => {
     const { rows } = await pool.query(`
       SELECT DISTINCT ON (p.device)
         p.device, p.lat, p.lng, p.estado, p.movimiento,
-        p.aceleracion, p.shock_pwr, p.sats, p.rssi, p.dist_borde, p.bateria, p.carga, p.ts
+        p.aceleracion, p.shock_pwr, p.sats, p.rssi, p.dist_borde, p.bateria, p.carga,
+        p.bloqueado, p.arreo, p.ts
       FROM posiciones p
       JOIN collar_dueno cd ON cd.device = p.device
       WHERE cd.dueno = $1
@@ -812,7 +1024,7 @@ app.get('/collares', requireAuth, async (req, res) => {
     `, [dueno]);
     res.json(rows);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    fail500(res, err);
   }
 });
 
@@ -824,7 +1036,7 @@ app.get('/animales', requireAuth, async (req, res) => {
     const dueno = await correoDeUsuario(req.userId);
     const { rows } = await pool.query('SELECT * FROM animales WHERE dueno=$1 ORDER BY id', [dueno]);
     res.json(rows);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { fail500(res, err); }
 });
 
 // Crear o actualizar un animal (upsert por id)
@@ -844,7 +1056,7 @@ app.post('/animales', requireAuth, async (req, res) => {
     `, [a.id, a.nombre||'Sin nombre', a.collar||'', a.arete||'',
         a.peso||0, a.edad||0, a.raza||'', a.sexo||'', a.lote||null, a.notas||'', dueno]);
     res.json({ ok: true, animal: rows[0] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { fail500(res, err); }
 });
 
 app.delete('/animales/:id', requireAuth, async (req, res) => {
@@ -852,7 +1064,7 @@ app.delete('/animales/:id', requireAuth, async (req, res) => {
     const dueno = await correoDeUsuario(req.userId);
     await pool.query('DELETE FROM animales WHERE id=$1 AND dueno=$2', [req.params.id, dueno]);
     res.json({ ok: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { fail500(res, err); }
 });
 
 // ─────────────────────────────────────────────────────────────
@@ -863,7 +1075,7 @@ app.get('/lotes', requireAuth, async (req, res) => {
     const dueno = await correoDeUsuario(req.userId);
     const { rows } = await pool.query('SELECT * FROM lotes WHERE dueno=$1 ORDER BY id', [dueno]);
     res.json(rows);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { fail500(res, err); }
 });
 
 app.post('/lotes', requireAuth, async (req, res) => {
@@ -879,7 +1091,7 @@ app.post('/lotes', requireAuth, async (req, res) => {
       RETURNING *
     `, [l.id, l.nombre||'Lote', l.color||'#4ade80', dueno]);
     res.json({ ok: true, lote: rows[0] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { fail500(res, err); }
 });
 
 app.delete('/lotes/:id', requireAuth, async (req, res) => {
@@ -887,7 +1099,153 @@ app.delete('/lotes/:id', requireAuth, async (req, res) => {
     const dueno = await correoDeUsuario(req.userId);
     await pool.query('DELETE FROM lotes WHERE id=$1 AND dueno=$2', [req.params.id, dueno]);
     res.json({ ok: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { fail500(res, err); }
+});
+
+// ─────────────────────────────────────────────────────────────
+//  v6 · POST /salud — el gateway sube el paquete de salud del collar
+//  (sin auth: es un endpoint de dispositivo, igual que /gps)
+// ─────────────────────────────────────────────────────────────
+app.post('/salud', async (req, res) => {
+  const {
+    device,
+    uptime_min = 0, bateria = 0, bateria_mv = 0, carga = 0,
+    pulsos = 0, avisos = 0, bloqueado = false,
+    reinicios = 0, reinicios_anormales = 0,
+    entrega_pct = 0, respaldo = 0, rssi = 0
+  } = req.body;
+  if (!device) return res.status(400).json({ error: 'device requerido' });
+  try {
+    await pool.query(`
+      INSERT INTO salud_collares
+        (device, uptime_min, bateria, bateria_mv, carga, pulsos, avisos,
+         bloqueado, reinicios, reinicios_anormales, entrega_pct, respaldo, rssi)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+    `, [device, uptime_min, bateria, bateria_mv, carga, pulsos, avisos,
+        !!bloqueado, reinicios, reinicios_anormales, entrega_pct, respaldo, rssi]);
+    console.log(`💚 Salud ${device}: bat ${bateria}% | entrega ${entrega_pct}% | reinicios ${reinicios} (${reinicios_anormales} anormales)`);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('POST /salud error:', err.message);
+    fail500(res, err);
+  }
+});
+
+// ─────────────────────────────────────────────────────────────
+//  v6 · GET /salud — dashboard: última salud de cada collar del rancho
+//  ?device=collar_01&limit=20 → historial de ese collar
+// ─────────────────────────────────────────────────────────────
+app.get('/salud', requireAuth, async (req, res) => {
+  const { device, limit = 20 } = req.query;
+  try {
+    const dueno = await correoDeUsuario(req.userId);
+    if (device) {
+      const { rows } = await pool.query(`
+        SELECT s.* FROM salud_collares s
+        JOIN collar_dueno cd ON cd.device = s.device
+        WHERE s.device = $1 AND cd.dueno = $2
+        ORDER BY s.ts DESC LIMIT $3
+      `, [device, dueno, Math.min(parseInt(limit), 500)]);
+      return res.json(rows);
+    }
+    const { rows } = await pool.query(`
+      SELECT DISTINCT ON (s.device) s.*
+      FROM salud_collares s
+      JOIN collar_dueno cd ON cd.device = s.device
+      WHERE cd.dueno = $1
+      ORDER BY s.device, s.ts DESC
+    `, [dueno]);
+    res.json(rows);
+  } catch (err) { fail500(res, err); }
+});
+
+// ─────────────────────────────────────────────────────────────
+//  v6 · MODO ARREO — mover ganado entre potreros sin estímulo
+//
+//  GET  /arreo          → estado actual + progreso por collar
+//  POST /arreo          → iniciar { duracion_min, destino_valla_id? }
+//  POST /arreo/terminar → terminar manualmente
+//
+//  El gateway NO usa estos endpoints: lee el flag "arreo" que
+//  /geovallas agrega a su respuesta. La expiración vive aquí.
+// ─────────────────────────────────────────────────────────────
+app.get('/arreo', requireAuth, async (req, res) => {
+  try {
+    const dueno = await correoDeUsuario(req.userId);
+    const a = await arreoVigente(dueno);
+    if (!a) return res.json({ activo: false });
+
+    const restanteMin = Math.max(0, Math.round(
+      (new Date(a.inicio).getTime() + a.duracion_min * 60000 - Date.now()) / 60000));
+
+    let destino = null;
+    const progreso = [];
+    if (a.destino_valla_id) {
+      const v = await pool.query(
+        'SELECT id, nombre, poligono FROM geovallas WHERE id=$1', [a.destino_valla_id]);
+      if (v.rows.length) {
+        destino = { id: v.rows[0].id, nombre: v.rows[0].nombre };
+        const cds = await pool.query(
+          'SELECT device FROM collar_dueno WHERE dueno=$1 ORDER BY device', [dueno]);
+        for (const cd of cds.rows) {
+          const p = await pool.query(`
+            SELECT lat, lng, ts, arreo FROM posiciones
+            WHERE device = $1 AND historico IS NOT TRUE
+            ORDER BY ts DESC LIMIT 1
+          `, [cd.device]);
+          progreso.push({
+            device: cd.device,
+            dentro: p.rows.length
+              ? puntoEnPoligonoSrv(p.rows[0].lat, p.rows[0].lng, v.rows[0].poligono)
+              : false,
+            confirmado: p.rows.length ? !!p.rows[0].arreo : false,
+            ultima_pos: p.rows.length ? p.rows[0].ts : null
+          });
+        }
+      }
+    }
+    res.json({
+      activo: true, inicio: a.inicio, duracion_min: a.duracion_min,
+      restante_min: restanteMin, destino, progreso
+    });
+  } catch (err) { fail500(res, err); }
+});
+
+app.post('/arreo', requireAuth, async (req, res) => {
+  const { duracion_min = 120, destino_valla_id = null } = req.body;
+  const dur = parseInt(duracion_min);
+  if (!dur || dur < 5 || dur > 480) {
+    return res.status(400).json({ error: 'duracion_min debe estar entre 5 y 480' });
+  }
+  try {
+    const dueno = await correoDeUsuario(req.userId);
+    if (destino_valla_id) {
+      const v = await pool.query(
+        'SELECT id FROM geovallas WHERE id=$1 AND dueno=$2 AND activa=true', [destino_valla_id, dueno]);
+      if (!v.rows.length) {
+        return res.status(400).json({ error: 'el potrero destino no existe o no está activo' });
+      }
+    }
+    // Cerrar cualquier arreo previo del rancho antes de abrir el nuevo
+    await pool.query(
+      'UPDATE modo_arreo SET activo=false, terminado_en=NOW() WHERE dueno=$1 AND activo=true', [dueno]);
+    const { rows } = await pool.query(`
+      INSERT INTO modo_arreo (dueno, activo, destino_valla_id, duracion_min)
+      VALUES ($1, true, $2, $3) RETURNING *
+    `, [dueno, destino_valla_id || null, dur]);
+    console.log(`🐄 ARREO iniciado por ${dueno}: ${dur} min${destino_valla_id ? ' → valla ' + destino_valla_id : ' (sin destino)'}`);
+    res.json({ ok: true, arreo: rows[0] });
+  } catch (err) { fail500(res, err); }
+});
+
+app.post('/arreo/terminar', requireAuth, async (req, res) => {
+  try {
+    const dueno = await correoDeUsuario(req.userId);
+    await pool.query(
+      'UPDATE modo_arreo SET activo=false, terminado_en=NOW() WHERE dueno=$1 AND activo=true', [dueno]);
+    console.log(`🐄 Arreo de ${dueno} terminado manualmente.`);
+    res.json({ ok: true });
+  } catch (err) { fail500(res, err); }
 });
 
 // ─────────────────────────────────────────────────────────────
@@ -907,7 +1265,7 @@ app.post('/login', async (req, res) => {
     }
     const token = crearToken(u.id);
     res.json({ ok: true, token, rancho: u.rancho, correo: u.correo });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { fail500(res, err); }
 });
 
 // ADMIN: crear una cuenta de rancho (requiere contraseña de admin)
@@ -923,7 +1281,7 @@ app.post('/admin/usuarios', requireAdmin, async (req, res) => {
     res.json({ ok: true, usuario: rows[0] });
   } catch (err) {
     if (err.code === '23505') return res.status(400).json({ error: 'ese correo ya existe' });
-    res.status(500).json({ error: err.message });
+    fail500(res, err);
   }
 });
 
@@ -932,7 +1290,7 @@ app.get('/admin/usuarios', requireAdmin, async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT id,correo,rancho,creado FROM usuarios ORDER BY id');
     res.json(rows);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { fail500(res, err); }
 });
 
 // ADMIN: borrar una cuenta (y liberar sus collares para reasignarlos)
@@ -947,7 +1305,7 @@ app.delete('/admin/usuarios/:id', requireAdmin, async (req, res) => {
     }
     await pool.query('DELETE FROM usuarios WHERE id=$1', [req.params.id]);
     res.json({ ok: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { fail500(res, err); }
 });
 
 // ADMIN: asignar un collar (device) a un rancho (correo del dueño)
@@ -960,7 +1318,7 @@ app.post('/admin/asignar-collar', requireAdmin, async (req, res) => {
       [device, dueno.toLowerCase().trim()]
     );
     res.json({ ok: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { fail500(res, err); }
 });
 
 // ─────────────────────────────────────────────────────────────
@@ -975,7 +1333,7 @@ app.get('/admin/collares-asignados', requireAdmin, async (req, res) => {
       ORDER BY cd.device
     `);
     res.json(rows);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { fail500(res, err); }
 });
 
 // ─────────────────────────────────────────────────────────────
@@ -986,12 +1344,22 @@ app.delete('/admin/asignar-collar/:device', requireAdmin, async (req, res) => {
   try {
     await pool.query('DELETE FROM collar_dueno WHERE device = $1', [device]);
     res.json({ ok: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { fail500(res, err); }
 });
 
 // ─────────────────────────────────────────────────────────────
-app.listen(port, async () => {
-  await initDB();
+// Manejo global de errores de Express (rutas que lanzan de forma síncrona).
+app.use((err, req, res, next) => {
+  console.error('Error no controlado:', err);
+  if (res.headersSent) return next(err);
+  res.status(500).json({ error: 'error interno del servidor' });
+});
+// No morir en silencio ante promesas/excepciones sin capturar.
+process.on('unhandledRejection', (reason) => console.error('unhandledRejection:', reason));
+process.on('uncaughtException', (err) => console.error('uncaughtException:', err));
+
+const server = app.listen(port, async () => {
+  try { await initDB(); } catch (e) { console.error('initDB falló:', e); }
   console.log(`\n🚀 CollarGPS Server v3 en puerto ${port}`);
   console.log('   Endpoints disponibles:');
   console.log('   POST /gps          — posición + IMU');
@@ -1004,5 +1372,14 @@ app.listen(port, async () => {
   console.log('   POST /alertas/:id/leer — marcar alerta leída');
   console.log('   GET  /actividad    — métricas IMU por hora');
   console.log('   GET  /collares     — estado actual de todos');
+  console.log('   POST /salud        — salud del collar (v6)');
+  console.log('   GET  /salud        — última salud por collar (v6)');
+  console.log('   GET/POST /arreo    — modo arreo (v6)');
   console.log('   GET  /health       — health check\n');
+});
+
+// Apagado ordenado: Render envía SIGTERM en cada deploy.
+process.on('SIGTERM', () => {
+  console.log('SIGTERM recibido: cerrando servidor...');
+  server.close(() => pool.end().finally(() => process.exit(0)));
 });
