@@ -29,20 +29,20 @@ const IS_PROD = process.env.NODE_ENV === 'production';
 //  faltan, el server NO arranca. Esto elimina el default público anterior
 //  ('lindero-admin-2026') que permitía forjar tokens de cualquier usuario.
 //  En desarrollo se generan valores efímeros y se imprimen en consola.
-function requireSecret(name) {
+function requireSecret(name, minLen = 16) {
   const v = process.env[name];
-  if (v && v.length >= 16) return v;
+  if (v && v.length >= minLen) return v;
   if (IS_PROD) {
-    console.error(`FATAL: falta la variable de entorno ${name} (mín. 16 caracteres). El server no arrancará por seguridad.`);
+    console.error(`FATAL: ${name} no definida o demasiado corta (mín. ${minLen} caracteres). El server no arrancará por seguridad.`);
     process.exit(1);
   }
   const gen = crypto.randomBytes(24).toString('hex');
   console.warn(`⚠️  ${name} no definida (dev): usando valor efímero → ${gen}`);
   return gen;
 }
-// Clave de firma de tokens, INDEPENDIENTE de la contraseña de admin.
-const TOKEN_SIGNING_KEY = requireSecret('TOKEN_SIGNING_KEY');
-const ADMIN_PASSWORD    = requireSecret('ADMIN_PASSWORD');
+// La clave de firma debe ser larga/aleatoria (≥32); la contraseña de admin es humana (≥8).
+const TOKEN_SIGNING_KEY = requireSecret('TOKEN_SIGNING_KEY', 32);
+const ADMIN_PASSWORD    = requireSecret('ADMIN_PASSWORD', 8);
 // Caducidad del token de sesión y tope de seguridad de la intensidad de estímulo.
 const TOKEN_TTL_MS  = (Number(process.env.TOKEN_TTL_DAYS) || 30) * 24 * 60 * 60 * 1000;
 const SHOCK_PWR_MAX = Math.min(255, Math.max(0, Number(process.env.SHOCK_PWR_MAX) || 255));
