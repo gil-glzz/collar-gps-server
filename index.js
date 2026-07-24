@@ -380,6 +380,30 @@ async function initDB() {
       created TIMESTAMPTZ DEFAULT NOW()
     );
 
+    -- Infraestructura del rancho (2026-07-24): capa VISUAL/monitoreo, nunca toca la
+    -- lógica del collar. Cámaras, antenas, gateways, corrales, puertas, saladeros, etc.
+    CREATE TABLE IF NOT EXISTS instalaciones (
+      id          SERIAL PRIMARY KEY,
+      dueno       TEXT NOT NULL,
+      tipo        TEXT NOT NULL DEFAULT 'referencia',
+      nombre      TEXT NOT NULL DEFAULT 'Instalación',
+      descripcion TEXT,
+      lat         DOUBLE PRECISION,
+      lng         DOUBLE PRECISION,
+      poligono    JSONB,
+      estado      TEXT DEFAULT 'desconocido',
+      bateria     INT,
+      rssi        INT,
+      snr         REAL,
+      ultima_com  TIMESTAMPTZ,
+      cobertura_m REAL,
+      alertas     JSONB DEFAULT '[]',
+      meta        JSONB DEFAULT '{}',
+      activo      BOOLEAN DEFAULT true,
+      created     TIMESTAMPTZ DEFAULT NOW(),
+      updated     TIMESTAMPTZ DEFAULT NOW()
+    );
+
     CREATE TABLE IF NOT EXISTS visitas_aguaje (
       id        SERIAL PRIMARY KEY,
       aguaje_id INT NOT NULL,
@@ -449,6 +473,14 @@ async function initDB() {
     `ALTER TABLE posiciones ADD COLUMN IF NOT EXISTS historico BOOLEAN DEFAULT false`,
     `ALTER TABLE posiciones ADD COLUMN IF NOT EXISTS hace_s BIGINT DEFAULT 0`,
     `ALTER TABLE posiciones ADD COLUMN IF NOT EXISTS arreo BOOLEAN DEFAULT false`,
+    // Telemetría de campo 2026-07-24: precisión GPS (HDOP), calidad de enlace (SNR) y
+    // versión de firmware por posición, para diagnóstico durante las pruebas.
+    `ALTER TABLE posiciones ADD COLUMN IF NOT EXISTS hdop REAL`,
+    `ALTER TABLE posiciones ADD COLUMN IF NOT EXISTS snr REAL`,
+    `ALTER TABLE posiciones ADD COLUMN IF NOT EXISTS firmware TEXT`,
+    // Zonas 2026-07-24: categoría SEMÁNTICA de la cerca (potrero/prohibida/corredor/...).
+    // Es cosmética/organizativa; el enforcement sigue siendo 'tipo' (el collar no la ve).
+    `ALTER TABLE geovallas ADD COLUMN IF NOT EXISTS categoria TEXT DEFAULT 'potrero'`,
     // Fase 3: índices creados DESPUÉS de agregar columnas (dueno/collares ya existen).
     // Cada uno es su propia sentencia con try/catch en el loop: un fallo aislado no
     // arrastra a los demás ni aborta las migraciones. Idempotentes (IF NOT EXISTS).
@@ -461,6 +493,7 @@ async function initDB() {
     `CREATE INDEX IF NOT EXISTS idx_histcercas_valla  ON historial_cercas(valla_id)`,
     `CREATE INDEX IF NOT EXISTS idx_visitas_aguaje    ON visitas_aguaje(aguaje_id, ts_fin DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_aguajes_dueno     ON aguajes(dueno)`,
+    `CREATE INDEX IF NOT EXISTS idx_instalaciones_dueno ON instalaciones(dueno)`,
     `CREATE INDEX IF NOT EXISTS idx_animales_dueno    ON animales(dueno)`,
     `CREATE INDEX IF NOT EXISTS idx_lotes_dueno       ON lotes(dueno)`,
     `CREATE INDEX IF NOT EXISTS idx_collardueno_dueno ON collar_dueno(dueno)`,
@@ -524,8 +557,16 @@ app.post('/gps', requireDevice, async (req, res) => {
     reinicios_anormales = 0,
     historico   = false,
     hace_s      = 0,
-    arreo       = false
+    arreo       = false,
+    // Telemetría de campo 2026-07-24
+    hdop        = null,
+    snr         = null,
+    firmware    = null
   } = req.body;
+
+  const hdopNum = Number.isFinite(Number(hdop)) ? Number(hdop) : null;
+  const snrNum  = Number.isFinite(Number(snr))  ? Number(snr)  : null;
+  const fwStr   = (typeof firmware === 'string' && firmware) ? firmware.slice(0, 32) : null;
 
   const latNum = Number(lat), lngNum = Number(lng);
   if (!device || lat == null || lng == null ||
@@ -543,12 +584,13 @@ app.post('/gps', requireDevice, async (req, res) => {
       INSERT INTO posiciones
         (device, lat, lng, speed, sats, rssi, estado,
          dist_borde, movimiento, aceleracion, actividad_s, shock_pwr, bateria, carga,
-         bloqueado, reinicios_anormales, historico, hace_s, arreo, ts)
+         bloqueado, reinicios_anormales, historico, hace_s, arreo, hdop, snr, firmware, ts)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,
-              $15,$16,$17,$18,$19, NOW() - make_interval(secs => $20))
+              $15,$16,$17,$18,$19,$20,$21,$22, NOW() - make_interval(secs => $23))
     `, [device, lat, lng, speed, sats, rssi, estado,
         dist_borde, movimiento, aceleracion, actividad_s, shock_pwr, bateria, carga,
-        !!bloqueado, parseInt(reinicios_anormales) || 0, !!historico, haceSeg, !!arreo, haceSeg]);
+        !!bloqueado, parseInt(reinicios_anormales) || 0, !!historico, haceSeg, !!arreo,
+        hdopNum, snrNum, fwStr, haceSeg]);
 
     // ── Alertas por EPISODIO (no una nueva cada 5 segundos) ──
     // Si el collar sigue en el mismo estado (warn/shock), en vez de crear
@@ -736,10 +778,15 @@ function validarPoligono(poly) {
     Number.isFinite(Number(p.lat)) && Number(p.lat) >= -90  && Number(p.lat) <= 90 &&
     Number.isFinite(Number(p.lng)) && Number(p.lng) >= -180 && Number(p.lng) <= 180);
 }
+const CATEGORIAS_GEOVALLA = new Set([
+  'potrero','prohibida','corredor','alimentacion','manejo','referencia'
+]);
+
 app.post('/geovallas', requireAuth, async (req, res) => {
   const {
     nombre      = 'potrero',
     tipo        = 'permanente',
+    categoria   = 'potrero',
     poligono,
     warn_dist_m = 10,
     color       = '#1D9E75',
@@ -752,6 +799,8 @@ app.post('/geovallas', requireAuth, async (req, res) => {
     return res.status(400).json({ error: 'poligono necesita ≥3 vértices {lat,lng} numéricos y en rango' });
   if (!['permanente','temporal','exclusion','simbolica'].includes(tipo))
     return res.status(400).json({ error: 'tipo invalido' });
+  if (!CATEGORIAS_GEOVALLA.has(categoria))
+    return res.status(400).json({ error: 'categoria invalida' });
 
   let expiraCalc = null;
   if (tipo === 'temporal') {
@@ -766,9 +815,9 @@ app.post('/geovallas', requireAuth, async (req, res) => {
 
     const { rows } = await pool.query(`
       INSERT INTO geovallas
-        (nombre,tipo,poligono,activa,warn_dist_m,color,collares,expira_en,creada_por,dueno)
-      VALUES ($1,$2,$3,true,$4,$5,$6,$7,'app',$8) RETURNING *
-    `, [nombre, tipo, JSON.stringify(poligono),
+        (nombre,tipo,categoria,poligono,activa,warn_dist_m,color,collares,expira_en,creada_por,dueno)
+      VALUES ($1,$2,$3,$4,true,$5,$6,$7,$8,'app',$9) RETURNING *
+    `, [nombre, tipo, categoria, JSON.stringify(poligono),
         warn_dist_m, color, JSON.stringify(collares), expiraCalc, dueno]);
 
     await pool.query(
@@ -788,9 +837,11 @@ app.post('/geovallas', requireAuth, async (req, res) => {
 app.patch('/geovallas/:id', requireAuth, async (req, res) => {
   const id = parseInt(req.params.id);
   const { nombre, poligono, activa, warn_dist_m, color,
-          collares, horas_extra, expira_en } = req.body;
+          collares, horas_extra, expira_en, categoria } = req.body;
   if (poligono !== undefined && !validarPoligono(poligono))
     return res.status(400).json({ error: 'poligono necesita ≥3 vértices {lat,lng} numéricos y en rango' });
+  if (categoria !== undefined && !CATEGORIAS_GEOVALLA.has(categoria))
+    return res.status(400).json({ error: 'categoria invalida' });
   try {
     // Solo la cerca del dueño autenticado (evita mover/editar cercas ajenas).
     const dueno = await correoDeUsuario(req.userId);
@@ -810,14 +861,15 @@ app.patch('/geovallas/:id', requireAuth, async (req, res) => {
       UPDATE geovallas SET
         nombre=$1, poligono=COALESCE($2,poligono), activa=COALESCE($3,activa),
         warn_dist_m=COALESCE($4,warn_dist_m), color=COALESCE($5,color),
-        collares=COALESCE($6,collares), expira_en=$7, updated=NOW()
-      WHERE id=$8 RETURNING *
+        collares=COALESCE($6,collares), expira_en=$7, categoria=COALESCE($8,categoria),
+        updated=NOW()
+      WHERE id=$9 RETURNING *
     `, [nombre||v.nombre,
         poligono?JSON.stringify(poligono):null,
         activa!==undefined?activa:null,
         warn_dist_m||null, color||null,
         collares?JSON.stringify(collares):null,
-        nuevaExp, id]);
+        nuevaExp, categoria||null, id]);
 
     await pool.query(
       'INSERT INTO historial_cercas (valla_id,accion,detalle) VALUES ($1,$2,$3)',
@@ -865,10 +917,132 @@ app.post('/aguajes', requireAuth, async (req, res) => {
   } catch (err) { fail500(res, err); }
 });
 
+// PATCH /aguajes/:id — editar nombre, posición o radio (solo campos provistos).
+app.patch('/aguajes/:id', requireAuth, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'id inválido' });
+  const { nombre, lat, lng, radio_m } = req.body;
+  const latN = lat == null ? null : Number(lat);
+  const lngN = lng == null ? null : Number(lng);
+  const radN = radio_m == null ? null : Number(radio_m);
+  if ((latN != null && (!Number.isFinite(latN) || latN < -90 || latN > 90)) ||
+      (lngN != null && (!Number.isFinite(lngN) || lngN < -180 || lngN > 180)) ||
+      (radN != null && (!Number.isFinite(radN) || radN <= 0 || radN > 5000))) {
+    return res.status(400).json({ error: 'lat/lng/radio_m inválidos' });
+  }
+  try {
+    const dueno = await correoDeUsuario(req.userId);
+    const nombreN = (typeof nombre === 'string' && nombre.trim()) ? nombre.trim().slice(0, 60) : null;
+    const { rows } = await pool.query(
+      `UPDATE aguajes SET
+         nombre  = COALESCE($3, nombre),
+         lat     = COALESCE($4, lat),
+         lng     = COALESCE($5, lng),
+         radio_m = COALESCE($6, radio_m)
+       WHERE id = $1 AND dueno = $2 RETURNING *`,
+      [id, dueno, nombreN, latN, lngN, radN]);
+    if (!rows.length) return res.status(404).json({ error: 'aguaje no encontrado' });
+    res.json({ ok: true, aguaje: rows[0] });
+  } catch (err) { fail500(res, err); }
+});
+
 app.delete('/aguajes/:id', requireAuth, async (req, res) => {
   try {
     const dueno = await correoDeUsuario(req.userId);
     await pool.query('DELETE FROM aguajes WHERE id = $1 AND dueno = $2', [req.params.id, dueno]);
+    res.json({ ok: true });
+  } catch (err) { fail500(res, err); }
+});
+
+// ═════════════════════════════════════════════════════════════
+//  INSTALACIONES — infraestructura del rancho (capa visual/monitoreo).
+//  NUNCA toca la lógica del collar; solo se ve en el mapa. Scoped por dueño.
+// ═════════════════════════════════════════════════════════════
+const TIPOS_INSTALACION = new Set([
+  'camara','antena','gateway','torre','starlink','panel_solar','bebedero','pozo',
+  'tanque','corral','puerta','saladero','comedero','estacion_meteo','mantenimiento',
+  'sin_cobertura','referencia'
+]);
+
+app.get('/instalaciones', requireAuth, async (req, res) => {
+  try {
+    const dueno = await correoDeUsuario(req.userId);
+    const { rows } = await pool.query(
+      'SELECT * FROM instalaciones WHERE dueno = $1 ORDER BY id DESC', [dueno]);
+    res.json(rows);
+  } catch (err) { fail500(res, err); }
+});
+
+app.post('/instalaciones', requireAuth, async (req, res) => {
+  const { tipo = 'referencia', nombre = 'Instalación', descripcion = null,
+          lat, lng, cobertura_m = null } = req.body;
+  if (!TIPOS_INSTALACION.has(tipo)) return res.status(400).json({ error: 'tipo inválido' });
+  const latN = Number(lat), lngN = Number(lng);
+  if (!Number.isFinite(latN) || !Number.isFinite(lngN) ||
+      latN < -90 || latN > 90 || lngN < -180 || lngN > 180) {
+    return res.status(400).json({ error: 'lat/lng numéricos en rango requeridos' });
+  }
+  const covN = cobertura_m == null ? null : Number(cobertura_m);
+  if (covN != null && (!Number.isFinite(covN) || covN < 0 || covN > 100000)) {
+    return res.status(400).json({ error: 'cobertura_m inválida' });
+  }
+  try {
+    const dueno = await correoDeUsuario(req.userId);
+    const { rows } = await pool.query(
+      `INSERT INTO instalaciones (dueno, tipo, nombre, descripcion, lat, lng, cobertura_m)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      [dueno, tipo, String(nombre).slice(0, 80),
+       descripcion == null ? null : String(descripcion).slice(0, 500),
+       latN, lngN, covN]);
+    res.json({ ok: true, instalacion: rows[0] });
+  } catch (err) { fail500(res, err); }
+});
+
+app.patch('/instalaciones/:id', requireAuth, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'id inválido' });
+  const { tipo, nombre, descripcion, lat, lng, cobertura_m, estado, activo } = req.body;
+  if (tipo != null && !TIPOS_INSTALACION.has(tipo)) return res.status(400).json({ error: 'tipo inválido' });
+  const latN = lat == null ? null : Number(lat);
+  const lngN = lng == null ? null : Number(lng);
+  const covN = cobertura_m == null ? null : Number(cobertura_m);
+  if ((latN != null && (!Number.isFinite(latN) || latN < -90 || latN > 90)) ||
+      (lngN != null && (!Number.isFinite(lngN) || lngN < -180 || lngN > 180)) ||
+      (covN != null && (!Number.isFinite(covN) || covN < 0 || covN > 100000))) {
+    return res.status(400).json({ error: 'lat/lng/cobertura_m inválidos' });
+  }
+  try {
+    const dueno = await correoDeUsuario(req.userId);
+    const { rows } = await pool.query(
+      `UPDATE instalaciones SET
+         tipo        = COALESCE($3, tipo),
+         nombre      = COALESCE($4, nombre),
+         descripcion = COALESCE($5, descripcion),
+         lat         = COALESCE($6, lat),
+         lng         = COALESCE($7, lng),
+         cobertura_m = COALESCE($8, cobertura_m),
+         estado      = COALESCE($9, estado),
+         activo      = COALESCE($10, activo),
+         updated     = NOW()
+       WHERE id = $1 AND dueno = $2 RETURNING *`,
+      [id, dueno,
+       (typeof tipo === 'string') ? tipo : null,
+       (typeof nombre === 'string' && nombre.trim()) ? nombre.trim().slice(0, 80) : null,
+       descripcion == null ? null : String(descripcion).slice(0, 500),
+       latN, lngN, covN,
+       (typeof estado === 'string') ? estado.slice(0, 20) : null,
+       typeof activo === 'boolean' ? activo : null]);
+    if (!rows.length) return res.status(404).json({ error: 'instalación no encontrada' });
+    res.json({ ok: true, instalacion: rows[0] });
+  } catch (err) { fail500(res, err); }
+});
+
+app.delete('/instalaciones/:id', requireAuth, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'id inválido' });
+  try {
+    const dueno = await correoDeUsuario(req.userId);
+    await pool.query('DELETE FROM instalaciones WHERE id = $1 AND dueno = $2', [id, dueno]);
     res.json({ ok: true });
   } catch (err) { fail500(res, err); }
 });
@@ -1135,7 +1309,7 @@ app.get('/collares', requireAuth, async (req, res) => {
       SELECT DISTINCT ON (p.device)
         p.device, p.lat, p.lng, p.estado, p.movimiento,
         p.aceleracion, p.shock_pwr, p.sats, p.rssi, p.dist_borde, p.bateria, p.carga,
-        p.bloqueado, p.arreo, p.ts
+        p.bloqueado, p.arreo, p.hdop, p.snr, p.firmware, p.reinicios_anormales, p.ts
       FROM posiciones p
       JOIN collar_dueno cd ON cd.device = p.device
       WHERE cd.dueno = $1
