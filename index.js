@@ -701,24 +701,22 @@ app.get('/geovallas', async (req, res) => {
         const ar = await flagArreoParaDevice(device, og.rows[0].dueno);
         return res.json(rows.map(r => ({ ...r, arreo: ar })));
       }
-      // Si el collar no tiene dueño asignado, cae al comportamiento viejo.
+      // Collar SIN dueño asignado (p. ej. recién flasheado, aún no dado de alta).
+      // FAIL-SAFE (crítico 2026-07-23): NO devolver cercas de otros ranchos. Antes
+      // caía al "comportamiento viejo" que mezclaba las cercas activas de TODOS los
+      // ranchos → el gateway armaba un polígono deforme → el collar podía calcular
+      // "fuera" estando dentro y aplicar estímulo indebido. Responder [] (sin cerca
+      // = el collar no aplica estímulo) hasta que se dé de alta con
+      // POST /admin/asignar-collar.
+      return res.json([]);
     }
+    // Aquí solo se llega sin token y SIN device (todos los caminos con device
+    // retornan arriba). Listado anónimo de cercas activas (solo lectura).
     if (todas !== 'true') {
       query += ' WHERE activa = true';
     }
-    if (device) {
-      const cond = todas !== 'true' ? ' AND' : ' WHERE';
-      query += `${cond} (collares = '[]'::jsonb OR collares @> $1::jsonb)`;
-      params.push(JSON.stringify([device]));
-    }
     query += ' ORDER BY tipo DESC, id DESC';
     const { rows } = await pool.query(query, params);
-    // v6: si es el gateway preguntando por un collar sin dueño asignado,
-    // usar el arreo del rancho 'default'.
-    if (device) {
-      const ar = await flagArreoParaDevice(device, 'default');
-      return res.json(rows.map(r => ({ ...r, arreo: ar })));
-    }
     res.json(rows);
   } catch (err) {
     fail500(res, err);
